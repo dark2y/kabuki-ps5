@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// The native ShellUI control centre on the PC: the console's own model and layout
-// (native_model.hpp, native_layout.hpp) drive a recorded widget tree instead of PUI, and
-// ui/tools/native_preview.py draws that tree in a browser.
+// Kabuki on the PC: the console's own model and layout (native_model.hpp, native_layout.hpp)
+// drive a recorded widget tree instead of PUI, and preview/native_preview.py draws that tree in
+// a browser. The daemon's tile service and librespot adapter (src/daemon) run here too, fed by
+// the preview's librespot stand-in, so the whole path from librespot's lines to the card is the
+// console's.
 //
 // Usage: native_preview DATA_DIR FONT_DIR
-// Each line read: "held pressed circle open" (pad bits as the console's, circle/open 0 or 1).
-// Each line written: the frame as JSON (widgets, commands sent, now_ms). Widgets carry their
-// skin pixels the first time they are sent.
+// Each line read: a JSON object: held, pressed (pad bits as the console's), circle, open (0/1),
+// service (0: only mirror files someone else writes), linked (librespot running), lines (from it).
+// Each line written: the frame as JSON (widgets, commands, librespot's commands, now_ms).
+// Widgets carry their skin pixels the first time they are sent.
 #define _CRT_SECURE_NO_WARNINGS
 #include "native_layout.hpp"
+#include "librespot_adapter.hpp"
 #define STB_TRUETYPE_IMPLEMENTATION
 #include <stb_truetype.h>
 #include <chrono>
@@ -168,32 +172,64 @@ int main(int argc, char** argv) {
     if (argc < 3) { std::cerr << "usage: native_preview DATA_DIR FONT_DIR\n"; return 2; }
     std::ios::sync_with_stdio(false);
     Recorder recorder;
-    const std::string fonts = argv[2];
+    const std::string data = argv[1], fonts = argv[2];
     recorder.fonts[0].load(fonts + "/SST-Roman.otf");
     recorder.fonts[1].load(fonts + "/SST-Bold.otf");
     recorder.fonts[2].load(fonts + "/SST-Light.otf");
     recorder.fonts[3].load(fonts + "/SST-Medium.otf");
+    const auto start = std::chrono::steady_clock::now();
+    std::uint64_t now = 1000;
+    // The daemon's side, as on the console.
+    kabuki::Service service(data, [&now] { return now; });
+    auto to_librespot = nlohmann::json::array();
+    kabuki::LibrespotAdapter adapter(service, [&to_librespot](const std::string& line) { to_librespot.push_back(line); });
+    bool run_service = true, started = false;
     auto commands = nlohmann::json::array();
-    overlay::NativeModel model([&commands](int kind, int value, const char* text) {
+    overlay::NativeModel model([&](int kind, int value, const char* text) {
         commands.push_back({{"kind", kind}, {"value", value}, {"text", text ? text : ""}});
+        if (run_service) service.command(kind, value, text ? text : "");
     });
-    model.data_dir(argv[1]);
     overlay::native::Layout<Recorder> layout(recorder);
     if (!layout.create()) { std::cerr << "layout create failed\n"; return 1; }
-    const auto start = std::chrono::steady_clock::now();
     bool open = false, back = false;
-    std::uint64_t opening = 0;
-    std::uint32_t held = 0, pressed = 0;
-    int circle = 0, want_open = 0;
-    while (std::cin >> held >> pressed >> circle >> want_open) {
+    std::uint64_t opening = 0, last_stats = 0;
+    std::string input;
+    while (std::getline(std::cin, input)) {
+        const auto in = nlohmann::json::parse(input, nullptr, false);
+        if (!in.is_object()) continue;
         const auto now_us = std::uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                                               std::chrono::steady_clock::now() - start).count()) + 1000000;
-        const auto now = now_us / 1000;
+        now = now_us / 1000;
+        if (!started) {
+            started = true;
+            run_service = in.value("service", 1) != 0;
+            if (run_service) service.load_settings();
+            model.data_dir(data);
+        }
+        if (run_service) {
+            if (in.value("linked", 0)) adapter.connected(); else adapter.disconnected();
+            if (in.contains("lines") && in["lines"].is_array())
+                for (const auto& l : in["lines"]) if (l.is_string()) adapter.line(l.get<std::string>());
+            adapter.tick();
+            // Sample readings for the System card (the console's daemon reads its own).
+            if (now - last_stats >= 500) {
+                last_stats = now;
+                char text[512];
+                std::snprintf(text, sizeof text,
+                    "kabuki\t1\nstat\tcpu\t%.1f\nstat\tcpu_temp\t54\nstat\tsoc_temp\t61\nstat\tmem_used_gb\t9.4\n"
+                    "stat\tmem_total_gb\t12.5\nstat\tfps\t59.8\nstat\tfps_min\t56\nstat\tuptime_s\t%d\n"
+                    "info\tfirmware\t13.20\ninfo\taddress\t192.168.1.20\ninfo\tlibrespot\t%s\n",
+                    18 + 9 * std::sin(now / 1700.0), 2 * 3600 + 14 * 60 + int(now / 1000 % 60),
+                    service.system_note().empty() ? "Not running" : service.system_note().c_str());
+                kabuki::write_file_atomic(data + "/system.rec", text);
+            }
+        }
+        const int want_open = in.value("open", 0), circle = in.value("circle", 0);
+        const std::uint32_t held = in.value("held", 0u), pressed = in.value("pressed", 0u);
         if (want_open && !open) opening = now_us;
         open = want_open;
         back = false;
-        // As the console's input guardian: Circle in a card goes back to the rail; on the rail it closes.
-        // Circle closes, except inside a menu in the card (a popup, an open playlist's tracks).
+        // As the console's input guardian: Circle inside a menu in the card steps back; otherwise it closes.
         if (circle && open) {
             const auto v = model.view();
             if (v.nested) back = true;
@@ -201,21 +237,16 @@ int main(int argc, char** argv) {
         }
         if (open) {
             model.poll_files(now);
-            // Sample readings for the System tab (the console reads its own).
-            overlay::SystemStats st;
-            st.cpu = 18 + 9 * float(std::sin(now / 1700.0)); st.cpu_temp = 54; st.soc_temp = 61;
-            st.mem_used_gb = 9.4f; st.mem_total_gb = 12.5f; st.fps = 59.8f; st.fps_min = 56;
-            st.uptime_s = 2 * 3600 + 14 * 60 + int(now / 1000 % 60); st.firmware = "13.20";
-            st.address = "192.168.1.20"; st.librespot = "Connected";
-            model.system(st);
             model.tick(now, opening, held, pressed, back);
         }
         layout.frame(model.view(), open, now_us, opening);
         const auto view = model.view();
-        nlohmann::json out = {{"now_ms", now}, {"open", open}, {"commands", commands}, {"sounds", model.take_sounds()}, {"widgets", recorder.frame()},
-                              {"view", {{"tab", view.tab}, {"rail", view.rail}, {"focused", view.focused},
+        nlohmann::json out = {{"now_ms", now}, {"open", open}, {"commands", commands}, {"librespot", to_librespot},
+                              {"sounds", model.take_sounds()}, {"widgets", recorder.frame()},
+                              {"view", {{"tab", view.tab}, {"tile", view.tile}, {"rail", view.rail_at}, {"focused", view.focused},
                                         {"control", view.control}, {"seek", view.seek}, {"popup", view.popup}}}};
         commands = nlohmann::json::array();
+        to_librespot = nlohmann::json::array();
         std::cout << out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) << '\n' << std::flush;
     }
     return 0;

@@ -54,14 +54,21 @@ Everything lives in `/data/custom-overlays` (to be renamed `/data/kabuki`):
 |---|---|---|
 | `probe.log`, `probe.lock` | daemon | the log; one Kabuki at a time |
 | `stop.txt` | you (`tools/console.py stop`) | asks a running Kabuki to stop |
-| `settings.json` | daemon, from the worker's commands | shortcut, hold time, sounds, tile order |
-| `system.json` | daemon | the System tile's readings |
-| `player.json`, `library.json`, `tracks.json` | daemon, from librespot-ps5 | Now Playing, Library and track lists |
+| `settings.json` | daemon, from the worker's commands | shortcut, hold time, sounds, the tile arrangement and every tile seen |
+| `settings.rec`, `tiles.rec` | daemon | the same settings, and the registered tiles, for the worker |
+| `tile-<ID>.rec` | daemon | a tile's template data (`media` or `list`) |
+| `show.rec` | daemon | a provider asking to show one of its tiles |
+| `system.rec` | daemon | the System tile's readings |
 | `chip.png` | daemon | the System tile's icon |
+
+The worker reads only `.rec` files: simple tab-separated records (`src/common/records.hpp`). All
+JSON is parsed in the daemon.
 
 ## Providers (where this is going)
 
-Today the daemon talks to librespot-ps5 directly, over its control channel on
-`127.0.0.1:38574`. The plan is a small, versioned protocol that any homebrew can use to add
+Tiles have 6-character ids and are registered by their providers; Kabuki's own `KBKSYS` (System)
+and `KBKSET` (Settings, which can never be removed) always come last by default. Until
+librespot-ps5 registers its own tiles, the daemon's adapter (`src/daemon/librespot_adapter.hpp`)
+does it for librespot while its control channel on `127.0.0.1:38574` answers. The plan is a small, versioned protocol that any homebrew can use to add
 tiles. A tile either sends data to one of Kabuki's card templates, or describes its own card as
 a tree of widgets. Either way the card is only data: no third-party code runs inside SceShellUI.

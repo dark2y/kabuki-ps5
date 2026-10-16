@@ -36,8 +36,9 @@ RCO = REPO / 'assets' / 'system' / 'rco' / 'Sce.PlayStation.PUI_UI3.rco'  # what
 ICON_CACHE = OUT / 'icons'
 REFS = {'screens': REPO / 'build' / 'screens', 'shots': REPO / 'build' / 'shots'}  # console screenshots
 PAGE = Path(__file__).with_name('native_preview.html')
-SOURCES = [REPO / 'preview/native_preview.cpp', REPO / 'src/ui/native_layout.hpp',
-           REPO / 'src/ui/native_model.hpp', REPO / 'src/ui/browse.hpp', REPO / 'src/ui/player.hpp']
+SOURCES = [REPO / 'preview/native_preview.cpp', REPO / 'src/ui/native_layout.hpp', REPO / 'src/ui/native_model.hpp',
+           REPO / 'src/ui/player.hpp', REPO / 'src/common/records.hpp', REPO / 'src/common/tiles.hpp',
+           REPO / 'src/common/content.hpp', REPO / 'src/daemon/service.hpp', REPO / 'src/daemon/librespot_adapter.hpp']
 
 
 def build():
@@ -46,7 +47,8 @@ def build():
     OUT.mkdir(parents=True, exist_ok=True)
     compiler = os.environ.get('CXX') or ('C:/Program Files/LLVM/bin/clang++.exe' if os.name == 'nt' else 'clang++')
     cmd = [compiler, '-std=c++20', '-O2', '-Wall', '-Wextra', '-Wno-deprecated-literal-operator',
-           '-I', str(REPO / 'src/ui'), '-I', str(REPO / '.deps/nlohmann/include'),
+           '-I', str(REPO / 'src/ui'), '-I', str(REPO / 'src/common'), '-I', str(REPO / 'src/daemon'),
+           '-I', str(REPO / '.deps/nlohmann/include'), '-Wno-tautological-constant-out-of-range-compare',
            '-I', str(REPO / '.deps/stb'), str(SOURCES[0]), '-o', str(EXE)]
     print('building', EXE.name, flush=True)
     subprocess.run(cmd, check=True)
@@ -61,9 +63,11 @@ class Host:
         self.now = 0
         self.skins = {}
 
-    def step(self, held, pressed, circle, open_):
+    def step(self, held, pressed, circle, open_, lines=(), linked=True, service=True):
+        message = dict(held=held, pressed=pressed, circle=circle, open=open_, lines=list(lines),
+                       linked=1 if linked else 0, service=1 if service else 0)
         with self.lock:
-            self.proc.stdin.write(f'{held} {pressed} {circle} {open_}\n')
+            self.proc.stdin.write(json.dumps(message) + '\n')
             self.proc.stdin.flush()
             line = self.proc.stdout.readline()
         frame = json.loads(line)
@@ -89,7 +93,8 @@ def cover_svg(i, text):
 
 
 class Sample:
-    """A small stand-in for librespot-ps5: answers the panel's commands with its heard timeline."""
+    """A small stand-in for librespot-ps5: speaks its control channel's lines (state, library,
+    tracks) and answers its commands with a heard timeline, as librespot-ps5 does."""
     SONGS = [("Time's Arrow", 'The Weakerthans', 'Reconstruction Site', 172000), ('Cahokia', 'Greg Freeman', 'I Looked Out', 201000),
              ('A Very Long Song Title That Has To Scroll Along The Card', 'Some Artist With A Long Name Too', 'Album', 245000),
              ('One Great City!', 'The Weakerthans', 'Reconstruction Site', 162000), ('Plea From A Cat Named Virtute', 'The Weakerthans', 'Reconstruction Site', 230000),
@@ -117,6 +122,8 @@ class Sample:
         self.playing, self.shuffle, self.repeat, self.volume = True, False, 'off', 70
         self.position, self.at = 56000, host.now  # heard position at `at`
         self.pending_until = 0
+        self.linked = True
+        self.out = []  # lines for the daemon's librespot adapter
         self.write()
 
     def song(self, i):
@@ -139,7 +146,7 @@ class Sample:
                          changes=[{'in_ms': in_ms, 'position_ms': position, 'moving': moving}])
         else:
             state.update(position_ms=self.heard_now(now), moving=self.playing, pending=False)
-        write_json('player.json', {'at_ms': now, 'link': True, 'msg': {'state': state}})
+        self.out.append(json.dumps({'state': state, 'v': 1}))
 
     def later(self, ms, fn):
         self.timers.append((self.host.now + ms, fn))
@@ -161,50 +168,53 @@ class Sample:
         self.playing = True
         self.write((delay, position, True, held))
 
-    def command(self, kind, value, text):
-        now = self.host.now
-        if kind == 0:
+    def take(self):
+        out, self.out = self.out, []
+        return out
+
+    def command(self, line):
+        """One of librespot's commands, as the daemon's adapter sends it."""
+        c = json.loads(line)
+        cmd, now = c.get('cmd'), self.host.now
+        if cmd == 'play_pause':
             spot = self.heard_now(now)
             self.playing = not self.playing
             self.position, self.at = spot, now + 350
             self.write((350, spot, self.playing, spot))
-        elif kind == 1:
+        elif cmd == 'previous':
             self.start(self.current, 0, 600)
-        elif kind == 2 and self.queue:
+        elif cmd == 'next' and self.queue:
             self.start(self.queue.pop(0))
-        elif kind == 3:
-            self.shuffle = bool(value); self.write()
-        elif kind == 4:
-            self.repeat = ['off', 'all', 'one'][value % 3]; self.write()
-        elif kind == 6:
-            self.volume = value; self.write()
-        elif kind == 7:
-            self.position, self.at = value, now + 900
-            self.write((900, value, self.playing, value))
-        elif kind == 8:
-            i = int(text.rsplit(':', 1)[1]) if text else self.queue[value]
+        elif cmd == 'shuffle':
+            self.shuffle = bool(c.get('on')); self.write()
+        elif cmd == 'repeat':
+            self.repeat = c.get('mode', 'off'); self.write()
+        elif cmd == 'volume':
+            self.volume = int(c.get('value', 0)); self.write()
+        elif cmd == 'seek':
+            ms = int(c.get('ms', 0))
+            self.position, self.at = ms, now + 900
+            self.write((900, ms, self.playing, ms))
+        elif cmd == 'play_queued':
+            i = int(c['uri'].rsplit(':', 1)[1])
             if i in self.queue:
                 self.queue = self.queue[self.queue.index(i) + 1:]
             self.start(i, 0, 1300)
-        elif kind == 9:
-            items = [dict(kind=k, uri=u, name=n, subtitle=s, cover=f'/sample/covers/{j % len(self.SONGS)}.svg')
-                     for j, (k, u, n, s) in enumerate(self.lists)]
-            self.later(900, lambda: write_json('library.json', {'library': {'items': items, 'error': ''}}))
-        elif kind == 10:
-            uri = text
-            items = [dict(uri=f'spotify:track:{i}', title=s[0], artist=s[1]) for i, s in enumerate(self.SONGS)]
-            self.later(600, lambda: write_json('tracks.json', {'tracks': {'uri': uri, 'items': items, 'error': ''}}))
-        elif kind == 11:
-            track = text.split(' ')[-1]
-            self.start(int(track.rsplit(':', 1)[1]), 0, 1300)
-        elif kind == 12:  # Kabuki's settings, as the parent keeps them
-            values = dict(part.split('=') for part in text.split())
-            write_json('settings.json', {'chord': int(values['chord']), 'hold_ms': int(values['hold']),
-                                         'sounds': values['sounds'] == '1', 'tiles': values.get('tiles', 'nqlys..')})
+        elif cmd == 'library':
+            items = [dict(kind=k, uri=u, name=n, subtitle=st, cover=f'/sample/covers/{j % len(self.SONGS)}.svg')
+                     for j, (k, u, n, st) in enumerate(self.lists)]
+            self.later(900, lambda: self.out.append(json.dumps({'library': {'items': items, 'error': ''}, 'v': 1})))
+        elif cmd == 'open_list':
+            uri = c['uri']
+            items = [dict(uri=f'spotify:track:{i}', title=x[0], artist=x[1]) for i, x in enumerate(self.SONGS)]
+            self.later(600, lambda: self.out.append(json.dumps({'tracks': {'uri': uri, 'items': items, 'error': ''}, 'v': 1})))
+        elif cmd == 'play':
+            self.start(int(c['track'].rsplit(':', 1)[1]), 0, 1300)
 
 
 class Live:
-    """Mirrors the console's files (read over FTP). Commands are not sent back."""
+    """Mirrors the console's tile files (read over FTP), as its daemon writes them. Commands
+    aren't sent back."""
     def __init__(self, host, address):
         self.host, self.address = host, address
         self.seen = {}
@@ -221,7 +231,10 @@ class Live:
         while True:
             try:
                 ftp = ftp or self.connect()
-                for name in ('player.json', 'library.json', 'tracks.json'):
+                names = ['tiles.rec', 'settings.rec', 'show.rec', 'system.rec']
+                names += ['tile-' + line.split('\t')[1] + '.rec' for line in (self.seen.get('tiles.rec') or b'').decode().splitlines()
+                          if line.startswith('tile\t')]
+                for name in names:
                     buf = io.BytesIO()
                     try:
                         ftp.retrbinary(f'RETR /data/custom-overlays/{name}', buf.write)
@@ -231,10 +244,7 @@ class Live:
                     if self.seen.get(name) == data:
                         continue
                     self.seen[name] = data
-                    value = json.loads(data)
-                    if name == 'player.json':
-                        value['at_ms'] = self.host.now  # the console's clock is not ours: heard as of now
-                    write_json(name, value)
+                    (DATA / name).write_bytes(data)  # times are the console's clock: the bar may jump
             except Exception as e:  # keep trying; the console may be asleep
                 print('live:', e, flush=True)
                 ftp = None
@@ -251,7 +261,10 @@ class Live:
             local.write_bytes(buf.getvalue())
         return local
 
-    def command(self, kind, value, text):
+    def take(self):
+        return []
+
+    def command(self, line):
         pass
 
     def tick(self):
@@ -301,10 +314,11 @@ def main():
     args = ap.parse_args()
     build()
     DATA.mkdir(parents=True, exist_ok=True)
-    for name in ('player.json', 'library.json', 'tracks.json'):
-        (DATA / name).unlink(missing_ok=True)
+    for old in DATA.glob('*'):
+        if old.suffix in ('.rec', '.json', '.tmp') and old.name != 'settings.json':
+            old.unlink(missing_ok=True)
     host = Host()
-    host.step(0, 0, 0, 0)
+    host.step(0, 0, 0, 0, service=not args.console)
     player = Live(host, args.console) if args.console else Sample(host)
     log = []
 
@@ -339,10 +353,14 @@ def main():
                 return self.send(PAGE.read_bytes(), 'text/html; charset=utf-8')
             if url.path == '/frame':
                 player.tick()
-                frame = host.step(int(q.get('held', 0)), int(q.get('pressed', 0)), int(q.get('circle', 0)), int(q.get('open', 0)))
-                for c in frame['commands']:
-                    log.append(c)
-                    player.command(c['kind'], c['value'], c['text'])
+                linked = q.get('linked', '1') == '1'
+                if not args.console:
+                    player.linked = linked
+                frame = host.step(int(q.get('held', 0)), int(q.get('pressed', 0)), int(q.get('circle', 0)), int(q.get('open', 0)),
+                                  player.take() if linked else [], linked, not args.console)
+                log.extend(frame['commands'])
+                for line in frame['librespot']:
+                    player.command(line)
                 return self.send(json.dumps(frame).encode(), 'application/json')
             if url.path.startswith('/icon/'):
                 return self.file(icon(url.path[6:]))

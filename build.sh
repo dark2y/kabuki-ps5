@@ -33,7 +33,7 @@ common=(-O2 -march=znver2 -fPIC -Wall -Wextra -ffile-prefix-map="$repo"=.
 
 # The worker that runs inside ShellUI: PUI widgets, input, the interface.
 "$sdk/bin/prospero-clang++" "${common[@]}" -Werror -Wno-deprecated-literal-operator -std=c++20 \
-    -I"$repo/src/shellui" -I"$repo/src/ui" -I"$json" \
+    -I"$repo/src/shellui" -I"$repo/src/ui" \
     -shared -Wl,-e,elf_main -Wl,-Bsymbolic -Wl,--hash-style=sysv -Wl,--eh-frame-hdr \
     -Wl,-T,"$repo/src/shellui/constructors.ld" \
     "$repo/src/shellui/worker.cpp" -lScePad -lmonosgen-2.0 -lkernel_sys -lSceLibcInternal -o "$out/worker.elf"
@@ -49,13 +49,13 @@ python3 "$repo/tools/embed-shim.py" "$out/lookup-shim.bin" "$out/lookup-blob.c"
 "$sdk/bin/prospero-clang" "${common[@]}" -c "$out/lookup-blob.c" -o "$out/lookup-blob.o"
 
 # The payload itself (the daemon): loads the worker, reads the pad, links to providers.
-daemon=("${common[@]}" "$out/lookup-blob.o" -DPROBE_CAPTURE -I"$repo/src/daemon")
+daemon=("${common[@]}" "$out/lookup-blob.o" -DPROBE_CAPTURE -I"$repo/src/daemon" -I"$json")
 if [[ $dev == 1 ]]; then
     build_id=$(sha256sum "$out/worker.elf" | cut -c1-16)
     daemon+=(-DPROBE_DEV_REPLACE "-DPROBE_BUILD_ID=0x${build_id}ULL")
     echo "Development build (replaces a running Kabuki), worker build id $build_id"
 fi
-"$sdk/bin/prospero-clang++" "${daemon[@]}" -Werror -std=c++20 "$repo/src/daemon/controller.cpp" \
+"$sdk/bin/prospero-clang++" "${daemon[@]}" -Werror -Wno-deprecated-literal-operator -std=c++20 "$repo/src/daemon/controller.cpp" \
     "$repo/src/loader/stable_shellui_injector.cpp" "$repo/src/loader/remote_call.cpp" \
     "$out/pt.o" "$out/elfldr.o" "$out/blob.o" -lSceSystemService -lkernel_sys -lSceLibcInternal \
     -o "$repo/build/kabuki-ps5.elf"

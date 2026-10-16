@@ -1,5 +1,5 @@
 /* The System tab's readings, gathered by the parent (an ordinary payload process) once a second
-   while the panel is open and written to /data/custom-overlays/system.json for the panel.
+   while the panel is open and written to /data/custom-overlays/system.rec for the panel.
    CPU follows drakmor/ps5-hwinfo (each core's idle thread, found by name); the frame rate is the
    display controller's flip counter as Common FPS for PS5 / SimpleFPS read it.
    SPDX-License-Identifier: GPL-3.0-or-later */
@@ -20,19 +20,14 @@ public:
         sample(now);
         char firmware[16]; std::snprintf(firmware,sizeof firmware,"%x.%02x",sdk>>24,(sdk>>16)&0xffU);
         timespec up{}; clock_gettime(CLOCK_MONOTONIC,&up);
-        char json[768];
-        std::snprintf(json,sizeof json,
-            "{\"cpu\":%.1f,\"cpu_temp\":%d,\"soc_temp\":%d,\"mem_used_gb\":%.2f,\"mem_total_gb\":%.2f,"
-            "\"fps\":%.1f,\"fps_min\":%.1f,\"uptime_s\":%lld,\"firmware\":\"%s\",\"address\":\"%s\",\"librespot\":\"%s\"}",
+        char text[768];
+        std::snprintf(text,sizeof text,
+            "kabuki\t1\nstat\tcpu\t%.1f\nstat\tcpu_temp\t%d\nstat\tsoc_temp\t%d\nstat\tmem_used_gb\t%.2f\nstat\tmem_total_gb\t%.2f\n"
+            "stat\tfps\t%.1f\nstat\tfps_min\t%.1f\nstat\tuptime_s\t%lld\ninfo\tfirmware\t%s\ninfo\taddress\t%s\ninfo\tlibrespot\t%s\n",
             cpu,cpu_temp,soc_temp,mem_used/1024.0,mem_total/1024.0,fps_average(),fps_lowest(),(long long)up.tv_sec,firmware,
             address().c_str(),librespot?"Connected":"Not running");
-        const int fd=open("/data/custom-overlays/system.json.partial",O_WRONLY|O_CREAT|O_TRUNC,0644);
-        if(fd<0) return;
-        const auto length=(ssize_t)std::strlen(json);
-        const bool ok=write(fd,json,length)==length;
-        close(fd);
-        if(ok) rename("/data/custom-overlays/system.json.partial","/data/custom-overlays/system.json");
-        if(samples<=3) note("SYSTEM stats %s",json);
+        kabuki::write_file_atomic("/data/custom-overlays/system.rec",text);
+        if(samples<=3) note("SYSTEM stats %.200s",text);
     }
 private:
     // sceKernelGetCpuUsage's entry (ps5-hwinfo's proc_stats_t, 40 bytes).

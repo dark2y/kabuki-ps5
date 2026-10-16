@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# Host checks for the interface's model and the library browser (any C++20 compiler).
+# Host checks for tiles, settings, the librespot adapter and the panel's model (any C++20 compiler).
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
-json="$repo/.deps/nlohmann/include"
 cxx=${CXX:-g++}
 mkdir -p "$repo/build/tests"
-for test in browse native_model; do
-    "$cxx" -std=c++20 -Wall -Wextra -Werror -I"$repo/src/ui" -I"$json" \
-        "$repo/tests/$test.cpp" -o "$repo/build/tests/$test"
-    "$repo/build/tests/$test"
-done
+"$cxx" -std=c++20 -Wall -Wextra -Werror -Wno-deprecated-literal-operator \
+    -I"$repo/src/common" -I"$repo/src/ui" -I"$repo/src/daemon" -I"$repo/.deps/nlohmann/include" \
+    "$repo/tests/tiles.cpp" -o "$repo/build/tests/tiles"
+"$repo/build/tests/tiles"

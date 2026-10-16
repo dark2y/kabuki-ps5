@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <initializer_list>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -26,11 +27,6 @@ constexpr int kTabs = 7; // sidebar slots (kSlots): the tiles Settings puts ther
 constexpr const char* kChipIcon = "/user/data/custom-overlays/chip.png";
 constexpr float kRailStep = 120; // between the tiles' centres
 inline float rail_y0(int count) { return 135 + 810 / 2.0f - kRailStep * (std::max(count, 1) - 1) / 2; } // the first's centre
-// What each kind of tile shows (by the card it opens).
-inline const char* tile_name(int t) {
-    static const char* names[] = {"Now Playing", "Queue", "Library", "System", "Settings"};
-    return t >= 0 && t < 5 ? names[t] : "Empty";
-}
 constexpr float kRailDisc = 72, kRailIcon = 40;
 constexpr float kRailLabelW = 200, kRailLabelH = 34, kRailLabelBelow = 8;
 constexpr float kCardX = 1196, kCardY = 135, kCardW = 520, kCardH = 810;
@@ -247,7 +243,7 @@ template <class B> class Layout {
     bool known_ = false, card_out_ = false;
     float card_fade_ = 1, card_from_ = 1;
     float focus_x_ = -9999, rail_y_ = -9999, scroll_ = -9999, sel_ = 0, scrub_ = 0;
-    int list_key_ = -1;
+    std::string list_key_ = "-";
     float rows_a_ = 0, skel_a_ = 0, msg_a_ = 0;
     bool rows_out_ = false; // the last list's rows fading out before the new list's are shown
     float rail_disc_a_ = 0, rail_icon_a_[kTabs]{}, rail_ink_[kTabs]{}, rail_label_a_[kTabs]{};
@@ -256,10 +252,11 @@ template <class B> class Layout {
     float wrap_t_ = -1, wrap_from_ = 0, wrap_a_ = 1, wrap_a0_ = 1;
     float popup_t_ = 0, opt_y_ = -9999, vol_ = -1, sw_ = -1;
     float set_y_ = -9999, set_sw_ = -1, pick_t_ = 0, pick_y_ = -9999;
-    float rail_tile_y_[kTileKinds], rail_tile_a_[kTileKinds]{}; // per tile: its centre on the rail, fading in when put on
-    float side_tile_y_[kTileKinds], side_tile_a_[kTileKinds]{}, side_empty_y_[kSlots]; // the Sidebar page's rows
+    std::map<std::string, float> rail_tile_y_, rail_tile_a_; // per tile: its centre on the rail, fading in when put on
+    std::map<std::string, float> side_tile_y_, side_tile_a_; // the Sidebar page's rows, per tile
+    float side_empty_y_[kSlots];
     void unplace() {
-        for (int i = 0; i < kTileKinds; ++i) { rail_tile_y_[i] = side_tile_y_[i] = -9999; rail_tile_a_[i] = side_tile_a_[i] = 0; }
+        rail_tile_y_.clear(); rail_tile_a_.clear(); side_tile_y_.clear(); side_tile_a_.clear();
         for (auto& y : side_empty_y_) y = -9999;
     }
     int popup_kind_ = 1;
@@ -528,16 +525,16 @@ public:
             unplace();
         }
         // Between tabs: the old card fades out, the new one fades in.
-        if (view.tab != display_.tab && !card_out_) { card_out_ = true; card_at_ = now_us; card_from_ = card_fade_; }
-        else if (view.tab == display_.tab && card_out_) { card_out_ = false; card_at_ = now_us; card_from_ = card_fade_; }
+        if (view.tile != display_.tile && !card_out_) { card_out_ = true; card_at_ = now_us; card_from_ = card_fade_; }
+        else if (view.tile == display_.tile && card_out_) { card_out_ = false; card_at_ = now_us; card_from_ = card_fade_; }
         const float t = time(now_us, card_at_, card_out_ ? kCardOutMs : kCardInMs);
         card_fade_ = card_out_ ? card_from_ * (1 - smooth(t)) : card_from_ + (1 - card_from_) * smooth(t);
         if (card_out_ && t >= 1) { display_ = view; card_out_ = false; card_at_ = now_us; card_from_ = 0; scroll_ = -9999; }
-        else if (view.tab == display_.tab) display_ = view;
+        else if (view.tile == display_.tile) display_ = view;
         b.alpha(card_, card_fade_);
         // Kabuki's version, always at the bottom left; with Settings, the GitHub line fades in under it
         // (with the card, between tabs) and the version moves up a line to make room.
-        const float link = display_.tab == 4 ? card_fade_ : 0;
+        const float link = display_.tab == kSettings ? card_fade_ : 0;
         for (W* w : {&link_, &version_}) { b.alpha(*w, link); b.show(*w, link > 0.001f); } // fades only: no movement
         b.alpha(version_low_, 1 - link); b.show(version_low_, link < 0.999f);
         render(display_, now_us, dt);
@@ -549,14 +546,15 @@ public:
     }
 
 private:
-    std::string tile_icon(int t) {
-        const std::string icons[] = {b.icon("iconid_music"), b.icon("iconid_list"), b.icon("iconid_app_library_media"), kChipIcon,
-                                     b.icon("iconid_settings")};
-        return t >= 0 && t < 5 ? icons[t] : "";
+    // A tile's icon: one of the console's ("icon:<id>"), Kabuki's chip, or a provider's picture.
+    std::string tile_icon(const std::string& spec) {
+        if (spec.compare(0, 5, "icon:") == 0) return b.icon(spec.c_str() + 5);
+        if (spec == "chip") return kChipIcon;
+        if (spec.compare(0, 5, "file:") == 0) return spec.substr(5);
+        return "";
     }
     void rail(const NativeView& v, float dt) {
-        int order[kSlots];
-        const int n = v.settings.shown(order), at = v.settings.place(v.rail);
+        const int n = std::min(int(v.rail.size()), kTabs), at = std::min(v.rail_at, n - 1);
         const float y0 = rail_y0(n);
         const bool on_rail = !v.focused && at >= 0;
         if (on_rail) want_ = {10 + at, kRailX - kRailDisc / 2, y0 + at * kRailStep - kRailDisc / 2, kRailDisc, kRailDisc, kRailDisc / 2};
@@ -587,23 +585,24 @@ private:
         rail_disc_a_ = approach(rail_disc_a_, on_rail ? 1 : 0, dt, 0.09f); // ~0.3 s, crossfading with the card's focus
         b.geometry(rail_disc_, {kRailX - kRailDisc / 2, rail_y_, kRailDisc, kRailDisc});
         b.alpha(rail_disc_, rail_disc_a_ * wrap_a); b.show(rail_disc_, rail_disc_a_ * wrap_a > 0);
-        bool shown[kTileKinds]{};
-        for (int i = 0; i < n; ++i) if (order[i] < kTileKinds) shown[order[i]] = true;
-        for (int t = 0; t < kTileKinds; ++t) if (!shown[t]) { rail_tile_y_[t] = -9999; rail_tile_a_[t] = 0; }
+        for (auto it = rail_tile_y_.begin(); it != rail_tile_y_.end();) { // tiles gone from the rail fade in again when back
+            const bool there = std::any_of(v.rail.begin(), v.rail.end(), [&](const TileView& t) { return t.id == it->first; });
+            if (!there) { rail_tile_a_.erase(it->first); it = rail_tile_y_.erase(it); } else ++it;
+        }
         for (int i = 0; i < kTabs; ++i) {
             const bool there = i < n;
             b.show(rail_[i], there);
             if (!there) { b.show(rail_label_[i], false); continue; }
-            const int tile = order[i];
-            float& at_y = rail_tile_y_[tile];
+            const auto& tile = v.rail[std::size_t(i)].id;
+            float& at_y = rail_tile_y_.try_emplace(tile, -9999.0f).first->second;
             at_y = at_y < -9000 ? y0 + i * kRailStep : approach(at_y, y0 + i * kRailStep, dt, 0.045f, 0.05f);
             rail_tile_a_[tile] = approach(rail_tile_a_[tile], 1, dt, 0.06f);
             const float y = at_y;
-            b.picture(rail_[i], tile_icon(tile)); b.words(rail_label_[i], tile_name(tile));
+            b.picture(rail_[i], tile_icon(v.rail[std::size_t(i)].icon)); b.words(rail_label_[i], v.rail[std::size_t(i)].title);
             b.geometry(rail_[i], {kRailX - kRailIcon / 2, y - kRailIcon / 2, kRailIcon, kRailIcon});
             b.geometry(rail_label_[i], {kRailX - kRailLabelW / 2, y + kRailDisc / 2 + kRailLabelBelow, kRailLabelW, kRailLabelH});
             const bool lit = on_rail && at == i;
-            rail_icon_a_[i] = approach(rail_icon_a_[i], lit ? 1 : on_rail ? 0.62f : v.tab == tile ? 1 : 0.38f, dt, 0.09f);
+            rail_icon_a_[i] = approach(rail_icon_a_[i], lit ? 1 : on_rail ? 0.62f : v.tile == tile ? 1 : 0.38f, dt, 0.09f);
             rail_ink_[i] = approach(rail_ink_[i], lit ? 0 : 1, dt, 0.08f);
             rail_label_a_[i] = approach(rail_label_a_[i], lit ? 1 : 0, dt, 0.09f);
             const float ink = rail_ink_[i];
@@ -613,24 +612,9 @@ private:
         }
     }
 
-    static std::string header_title(const NativeView& v, const char* heading) {
-        if (v.tab == 4 && v.page == 1) return "Sidebar";
-        const auto& br = v.browse;
-        if (v.tab == 2 && br.library_level == 1) {
-            for (const auto& item : br.library)
-                if (item.uri == br.list_uri && !item.name.empty()) return item.name;
-            if (br.library_selected >= 0 && br.library_selected < int(br.library.size()) && !br.library[br.library_selected].name.empty())
-                return br.library[br.library_selected].name;
-        }
-        return heading;
-    }
-
     // Inside a playlist or album, its cover (corners rounded like the icon's tile) fades in over the icon.
     void header_art(const NativeView& v, float dt) {
-        const auto& br = v.browse;
-        std::string cover;
-        if (v.tab == 2 && br.library_level == 1 && br.library_selected >= 0 && br.library_selected < int(br.library.size()))
-            cover = br.library[br.library_selected].cover;
+        const std::string& cover = v.header_art;
         if (!cover.empty() && cover != header_art_uri_) { header_art_uri_ = cover; b.picture(header_art_, cover); header_art_a_ = 0; }
         header_art_a_ = approach(header_art_a_, cover.empty() ? 0 : 1, dt, 0.06f);
         for (W* w : {&header_art_, &header_corners_}) { b.alpha(*w, header_art_a_); b.show(*w, header_art_a_ > 0); }
@@ -654,12 +638,9 @@ private:
     }
 
     void render(const NativeView& v, std::uint64_t now, float dt) {
-        const bool playing = v.tab == 0;
-        const char* headings[] = {"Now Playing", "Queue", "Library", "System", "Kabuki Settings"};
-        const std::string icons[] = {b.icon("iconid_music"), b.icon("iconid_list"), b.icon("iconid_app_library_media"), kChipIcon,
-                                     b.icon("iconid_settings")};
-        title(header_title(v, headings[std::clamp(v.tab, 0, 4)]), now);
-        b.picture(header_icon_, icons[std::clamp(v.tab, 0, 4)]);
+        const bool playing = v.tab == kMedia;
+        title(v.header, now);
+        b.picture(header_icon_, tile_icon(v.header_icon));
         header_art(v, dt);
         for (W* w : {&cover_, &title_, &artist_, &bar_, &clock_, &duration_, &keys_[0], &keys_[1], &square_})
             b.show(*w, playing);
@@ -673,11 +654,11 @@ private:
     // Settings: the shortcut (recorded by holding the new buttons together), the hold time (a list
     // that opens under its row) and the interface sounds switch; Kabuki's version at the bottom.
     void settings(const NativeView& v, std::uint64_t now, float dt) {
-        const bool on = v.tab == 4, main = on && v.page == 0, side = on && v.page == 1;
+        const bool on = v.tab == kSettings, main = on && v.page == 0, side = on && v.page == 1;
         for (W* w : {&set_note_, &set_track_, &set_check_, &set_knob_, &set_chevron_, &side_more_}) b.show(*w, main);
         for (auto& w : set_label_) b.show(w, main);
         for (auto& w : set_value_) b.show(w, main);
-        for (int i = 0; i < kSlots; ++i) { b.show(side_label_[i], side); b.show(side_icon_[i], side && v.settings.tiles[i] >= 0); }
+        for (int i = 0; i < kSlots; ++i) { b.show(side_label_[i], side); b.show(side_icon_[i], side && v.slots[i].online); }
         b.show(side_star_, false);
         if (side) { sidebar_page(v, dt); return; }
         const bool lit = on && v.focused && !v.choosing;
@@ -705,8 +686,7 @@ private:
         char hold[16]; std::snprintf(hold, sizeof hold, "%.2g s", st.hold_ms / 1000.0);
         b.words(set_value_[1], hold);
         b.words(set_value_[2], "");
-        int order[kSlots];
-        char count[24]; std::snprintf(count, sizeof count, "%d tiles", v.settings.shown(order));
+        char count[24]; std::snprintf(count, sizeof count, "%d tiles", int(v.rail.size()));
         b.words(set_value_[3], count);
         // Sounds: the console's switch, as in Options.
         set_sw_ = set_sw_ < 0 ? (st.sounds ? 1.0f : 0.0f) : approach(set_sw_, st.sounds ? 1 : 0, dt, 0.05f, 0.002f);
@@ -740,7 +720,7 @@ private:
         if (buttons) want_ = {v.control, kCardX + control_x(v.control) - kDisc / 2, kCardY + kControlsY - kDisc / 2, kDisc, kDisc, kDisc / 2};
         popups(v, dt, playing);
         // The hint: Square, Pause or Play, below the card. A new word fades in over the old.
-        const bool sorting = v.tab == 4 && v.page == 1 && v.focused && !v.picking;
+        const bool sorting = v.tab == kSettings && v.page == 1 && v.focused && !v.picking;
         const std::string word = playing ? (s.playing ? "Pause" : "Play") : sorting ? (v.moving ? "Place" : "Move") : "";
         if (word != hint_words_[hint_now_]) { hint_now_ ^= 1; hint_words_[hint_now_] = word; hint_at_ = now; }
         const float hf = ease_out(time(now, hint_at_, kHintFadeMs));
@@ -855,33 +835,32 @@ private:
     // The sidebar page: its seven slots (icon and name, or Empty); the cursor's row lights, and a
     // tile being moved lights more. Cross opens the tile list beside the slot.
     void sidebar_page(const NativeView& v, float dt) {
-        const auto& st = v.settings;
-        bool placed[kTileKinds]{};
-        for (int t : st.tiles) if (t >= 0 && t < kTileKinds) placed[t] = true;
-        for (int t = 0; t < kTileKinds; ++t) if (!placed[t]) { side_tile_y_[t] = -9999; side_tile_a_[t] = 0; }
+        for (auto it = side_tile_y_.begin(); it != side_tile_y_.end();) {
+            const bool placed = std::any_of(std::begin(v.slots), std::end(v.slots), [&](const TileView& t) { return t.online && t.id == it->first; });
+            if (!placed) { side_tile_a_.erase(it->first); it = side_tile_y_.erase(it); } else ++it;
+        }
         float row_y[kSlots];
         for (int i = 0, empty = 0; i < kSlots; ++i) {
-            const int t = st.tiles[i];
+            const auto& t = v.slots[i];
             const float target = kListTop + i * kSideH;
-            float& y = t >= 0 ? side_tile_y_[t] : side_empty_y_[empty++];
+            float& y = t.online ? side_tile_y_.try_emplace(t.id, -9999.0f).first->second : side_empty_y_[empty++];
             y = y < -9000 ? target : approach(y, target, dt, 0.045f, 0.05f);
             row_y[i] = y;
             float a = 0.45f;
-            if (t >= 0) { side_tile_a_[t] = approach(side_tile_a_[t], 1, dt, 0.06f); a = side_tile_a_[t]; }
-            b.words(side_label_[i], tile_name(t));
+            if (t.online) { float& ta = side_tile_a_[t.id]; ta = approach(ta, 1, dt, 0.06f); a = ta; }
+            b.words(side_label_[i], t.online ? t.title : "Empty");
             b.tint(side_icon_[i], kWhite, 1);
-            if (t >= 0) b.picture(side_icon_[i], tile_icon(t));
+            if (t.online) b.picture(side_icon_[i], tile_icon(t.icon));
             b.alpha(side_label_[i], a); b.alpha(side_icon_[i], a);
             b.geometry(side_icon_[i], {kPad, y + (kSideH - 6) / 2 - 16, 32, 32});
             b.geometry(side_label_[i], text_box(kPad + 52, y + (kSideH - 6) / 2 + 9, 360, 24));
         }
         // The first tile shown opens with the panel: a small star after its name.
-        int order[kSlots];
-        if (v.settings.shown(order) > 0) {
-            int first = 0;
-            while (first < kSlots && st.tiles[first] < 0) ++first;
+        int first = 0;
+        while (first < kSlots && !v.slots[first].online) ++first;
+        if (first < kSlots) {
             const float y = row_y[first] + (kSideH - 6) / 2 - 11;
-            const float x = kPad + 52 + b.text_width(side_label_[first], tile_name(st.tiles[first])) + 10;
+            const float x = kPad + 52 + b.text_width(side_label_[first], v.slots[first].title) + 10;
             b.show(side_star_, true); b.tint(side_star_, kSecondary, 1);
             b.geometry(side_star_, {x, y, 22, 22});
         }
@@ -900,13 +879,19 @@ private:
         const float py = std::min(row + kSideH - 6, kCardH - kPickH - 12);
         b.alpha(pick_, pick_t_);
         b.geometry(pick_, {kPickX, py + (1 - ease_out(pick_t_)) * 12, kPickW, kPickH});
-        pick_y_ = approach(pick_y_, 8 + v.pick * kPickRowH, dt, 0.045f, 0.05f);
+        const int entries = int(v.picks.size()) + 1;
+        const int first_row = std::clamp(v.pick - (kChoices - 1), 0, std::max(0, entries - kChoices));
+        const int row_at = v.pick - first_row;
+        pick_y_ = approach(pick_y_, 8 + row_at * kPickRowH, dt, 0.045f, 0.05f);
         b.geometry(pick_focus_, {8, pick_y_, kPickW - 16, kPickRowH - 4});
         for (int i = 0; i < kChoices; ++i) {
-            b.words(pick_label_[i], tile_name(i < 5 ? i : -1));
-            b.show(pick_tick_[i], (i < 5 ? i : -1) == st.tiles[v.slot]);
+            const int e = first_row + i;
+            const bool none = e == entries - 1;
+            b.show(pick_label_[i], e < entries);
+            b.words(pick_label_[i], none ? "None" : e < entries - 1 ? v.picks[std::size_t(e)].title : "");
+            b.show(pick_tick_[i], e < entries && (none ? !v.slots[v.slot].online : v.picks[std::size_t(e)].id == v.slots[v.slot].id));
         }
-        if (v.picking) want_ = {47 + v.pick, kCardX + kPickX + 8, kCardY + py + 8 + v.pick * kPickRowH, kPickW - 16, kPickRowH - 4, 10};
+        if (v.picking) want_ = {47 + row_at, kCardX + kPickX + 8, kCardY + py + 8 + row_at * kPickRowH, kPickW - 16, kPickRowH - 4, 10};
     }
 
     static float stat_baseline(int i) {
@@ -915,7 +900,7 @@ private:
 
     // System: the console's readings, unavailable ones as a dash.
     void system(const NativeView& v) {
-        const bool on = v.tab == 3;
+        const bool on = v.tab == kStats;
         for (auto& w : sys_heading_) b.show(w, on);
         for (auto& w : sys_label_) b.show(w, on);
         for (auto& w : sys_value_) b.show(w, on);
@@ -978,30 +963,12 @@ private:
         bool covers = true;
         std::string first, second, heading;
         bool loading = false;
-        if (v.tab == 1) {
-            selected = v.browse.queue_selected;
-            for (const auto& q : v.state.queue) rows.push_back({q.title, q.artist, q.cover});
-            loading = !v.state.queue_known;
-            if (rows.empty() && !loading) { first = "Nothing queued"; second = "Add songs from the Spotify app"; }
-            else if (!rows.empty()) heading = "Up next";
-        } else if (v.tab == 2 && v.browse.library_level == 0) {
-            selected = v.browse.library_selected;
-            for (const auto& item : v.browse.library) rows.push_back({item.name, item.subtitle, item.cover});
-            loading = !v.browse.library_known;
-            if (loading) {}
-            else if (rows.empty()) {
-                first = v.browse.library_error.empty() ? "Nothing saved yet" : "Couldn't load your library";
-                second = v.browse.library_error.empty() ? "Save playlists and albums in Spotify" : v.browse.library_error;
-            } else heading = v.browse.library_error;
-        } else if (v.tab == 2) {
-            covers = false; selected = v.browse.track_selected;
-            for (const auto& item : v.browse.tracks) rows.push_back({item.title, item.artist, ""});
-            loading = !v.browse.tracks_known;
-            if (loading) {}
-            else if (rows.empty()) {
-                first = v.browse.tracks_error.empty() ? "No songs here" : "Couldn't load these songs";
-                second = v.browse.tracks_error;
-            }
+        if (v.tab == kList) {
+            const auto& l = v.list;
+            selected = l.selected; covers = l.covers; loading = l.loading;
+            for (const auto& r : l.rows) rows.push_back({r.title, r.subtitle, r.art});
+            if (!loading && rows.empty()) { first = l.empty; second = l.empty_detail; }
+            else if (!rows.empty()) heading = l.heading;
         }
         // An empty list's words, and the rows themselves, fade in; so does the skeleton while loading.
         loading = loading && !playing;
@@ -1022,10 +989,10 @@ private:
         const bool lit = shown && v.focused;
         // A new list (another tab or level) starts in place and fades in; within one, the rows
         // scroll and the selection glides.
-        const int key = v.tab * 10 + v.browse.library_level;
+        const std::string key = v.tab == kList ? v.list.key : std::to_string(v.tab);
         // Another list (opening a playlist, going back): the old rows fade out as they are (the
         // skeleton fading in over them), then the new list takes their place and fades in.
-        if (key != list_key_ && list_key_ >= 0 && rows_a_ > 0.01f && !rows_out_) rows_out_ = true;
+        if (key != list_key_ && list_key_ != "-" && rows_a_ > 0.01f && !rows_out_) rows_out_ = true;
         if (rows_out_) {
             rows_a_ = approach(rows_a_, 0, dt, 0.05f, 0.01f);
             b.alpha(list_, rows_a_);
@@ -1068,7 +1035,7 @@ private:
                 b.geometry(row_cover_[i], {kPad, cy, kRowCover, kRowCover});
                 b.picture(row_cover_[i], row.cover); b.tint(row_cover_[i], kWhite, 1);
             }
-            if (index == v.browse.starting_row) {
+            if (index == v.list.busy) {
                 starting = true;
                 const float p = float(now / 1000 % std::uint64_t(kSweepMs)) / kSweepMs;
                 b.geometry(row_sweep_, {18 + p * (kCardW - 36 - 140), y + kRowH - 6, 140, 3});

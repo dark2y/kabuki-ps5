@@ -39,7 +39,7 @@ let ctx = canvas.getContext('2d');
 const LIFT = 0.12; // native_layout.hpp kLabelLift: capitals sit this far (x size) above a label box's middle
 const WEIGHTS = {0: 400, 1: 700, 2: 300, 3: 500, 4: 300, 5: 700, 6: 500};
 const KINDS = ['face', 'rounded', 'disc', 'veil', 'ring', 'sweep'];
-let open = 0, held = 0, pressed = 0, circle = 0, frame = null, busy = false;
+let open = 0, held = 0, pressed = 0, circle = 0, frame = null, busy = false, linked = 1;
 const skins = {}, images = {}, tinted = {}, marquees = {};
 const log = [];
 
@@ -193,6 +193,7 @@ const keys = new Set();
 addEventListener('keydown', e => {
   if (e.target.tagName === 'SELECT' || e.target.tagName === 'INPUT') return;
   if (e.code === 'Space') { open ^= 1; e.preventDefault(); return; }
+  if (e.code === 'KeyL') { linked ^= 1; e.preventDefault(); return; } // librespot running or not
   if (e.code === 'Escape' || e.code === 'Backspace' || e.code === 'KeyC') { if (!e.repeat) circle = 1; e.preventDefault(); return; }
   const bit = KEYS[e.code];
   if (!bit) return;
@@ -239,7 +240,7 @@ async function step() {
     const send = pressed | (pad & ~padHeld);
     padHeld = pad;
     const sentOpen = open;
-    const url = `/frame?held=${now}&pressed=${send}&circle=${circle}&open=${open}`;
+    const url = `/frame?held=${now}&pressed=${send}&circle=${circle}&open=${open}&linked=${linked}`;
     pressed = 0; circle = 0;
     try {
       frame = await (await fetch(url)).json();

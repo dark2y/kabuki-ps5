@@ -1,5 +1,6 @@
 /* Manual, reversible ShellUI panel experiment. SPDX-License-Identifier: GPL-3.0-or-later */
 #include "protocol.hpp"
+#include "librespot_adapter.hpp"
 #include "legacy_focus.hpp"
 #include "prologue.hpp"
 #include "stable_shellui_injector.hpp"
@@ -144,26 +145,31 @@ static bool stage_fonts() {
 // The panel's link to librespot-ps5 (its control.rs): a loopback socket kept here, outside
 // ShellUI. Each state line is left in player_file, which the worker reads as
 // /user/data/...; commands come from the worker's State ring, which is only ever read.
+// Kabuki's tiles (src/daemon/service.hpp) and, until librespot-ps5 registers its own, its link to
+// librespot-ps5's control channel on 127.0.0.1:38574 (src/daemon/librespot_adapter.hpp). Both
+// write the files the worker reads; the worker's commands come from its State ring.
 class PlayerLink {
 public:
-    PlayerLink() { write_state(nullptr); }
+    PlayerLink() : service("/data/custom-overlays",monotonic_ms),
+                   adapter(service,[this](const std::string& line) { send_line(line); }) {
+        service.load_settings();
+        service.set_system_note("Not running");
+    }
     ~PlayerLink() { disconnect(false); }
     void tick(const State& s) {
         const auto now=sceKernelGetProcessTime();
         if(fd<0&&now>=next_attempt) connect_now(now);
         if(fd>=0) receive();
-        send_commands(s);
+        commands(s);
+        adapter.tick();
     }
-private:
-    static constexpr const char* player_file="/data/custom-overlays/player.json";
-    static constexpr const char* library_file="/data/custom-overlays/library.json";
-    static constexpr const char* tracks_file="/data/custom-overlays/tracks.json";
-    static constexpr std::uint16_t port=38574;
-    int fd=-1; std::uint64_t next_attempt=0; std::string input;
-    bool seq_known=false; std::uint32_t seq=0; bool logged_absent=false;
-public:
     bool linked() const { return fd>=0; }
 private:
+    static constexpr std::uint16_t port=38574;
+    kabuki::Service service;
+    kabuki::LibrespotAdapter adapter;
+    int fd=-1; std::uint64_t next_attempt=0; std::string input;
+    bool seq_known=false; std::uint32_t seq=0; bool logged_absent=false;
 
     static std::uint64_t monotonic_ms() {
         timespec t{}; clock_gettime(CLOCK_MONOTONIC,&t);
@@ -181,11 +187,13 @@ private:
         fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)|O_NONBLOCK);
         int yes=1; setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&yes,sizeof yes);
         note("LINK connected to librespot-ps5"); logged_absent=false; input.clear();
+        adapter.connected();
     }
     void disconnect(bool tell) {
         if(fd<0) return;
         close(fd); fd=-1; input.clear();
-        if(tell) { note("LINK librespot-ps5 disconnected"); write_state(nullptr); }
+        if(tell) note("LINK librespot-ps5 disconnected");
+        adapter.disconnected();
     }
     void receive() {
         char buffer[4096];
@@ -195,94 +203,34 @@ private:
             if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) break;
             disconnect(true); return;
         }
-        // Every complete line: library and track lists each to their own file; of the state
-        // lines only the newest matters.
+        // Library and track lists each matter; of the state lines only the newest.
         const auto end=input.rfind('\n'); if(end==std::string::npos) return;
         std::string newest_state;
         for(std::size_t from=0;from<=end;) {
             const auto stop=input.find('\n',from);
-            const std::string line=input.substr(from,stop-from);
+            std::string line=input.substr(from,stop-from);
             from=stop+1;
             if(line.empty()||line.front()!='{') continue;
-            // librespot-ps5 sorts its keys: {"library":…,"v":1}, {"state":…}, {"tracks":…}.
-            if(!line.compare(0,10,"{\"library\"")) write_file(library_file,line);
-            else if(!line.compare(0,9,"{\"tracks\"")) write_file(tracks_file,line);
-            else newest_state=line;
+            if(!line.compare(0,10,"{\"library\"")||!line.compare(0,9,"{\"tracks\"")) adapter.line(line);
+            else newest_state=std::move(line);
         }
         input.erase(0,end+1);
-        if(!newest_state.empty()) write_state(&newest_state);
+        if(!newest_state.empty()) adapter.line(newest_state);
     }
-    // Written beside, then renamed, so the worker never reads half a file.
-    static void write_file(const char* path,const std::string& text) {
-        const std::string temp=std::string(path)+".tmp";
-        FILE* f=std::fopen(temp.c_str(),"wb"); if(!f) return;
-        bool ok=std::fwrite(text.data(),1,text.size(),f)==text.size();
-        ok=std::fclose(f)==0&&ok;
-        if(ok) (void)std::rename(temp.c_str(),path);
+    void send_line(const std::string& line) {
+        if(fd<0) { note("LINK command dropped: librespot-ps5 not connected"); return; }
+        const std::string out=line+"\n";
+        if(send(fd,out.data(),out.size(),0)!=(ssize_t)out.size()) { disconnect(true); return; }
+        note("LINK sent %.120s",line.c_str());
     }
-    static void write_state(const std::string* line) {
-        write_file(player_file,line?"{\"at_ms\":"+std::to_string(monotonic_ms())+",\"link\":true,\"msg\":"+*line+"}"
-                                   :std::string("{\"link\":false}"));
-    }
-    // Spotify URIs only ("spotify:" and plain characters); anything else is not sent.
-    static bool plain_uri(const std::string& text) {
-        if(text.compare(0,8,"spotify:")||text.size()>120) return false;
-        for(const char c:text) if(!std::isalnum(static_cast<unsigned char>(c))&&c!=':'&&c!='_'&&c!='-') return false;
-        return true;
-    }
-    void send_commands(const State& s) {
+    void commands(const State& s) {
         if(!seq_known) { seq=s.command_seq; seq_known=true; return; } // Not earlier sessions' presses.
         if(s.command_seq-seq>8) seq=s.command_seq-8;
         for(;seq!=s.command_seq;++seq) {
+            char text[129]{}; std::memcpy(text,s.command_text[seq%8],128);
             const int kind=s.command_kind[seq%8],value=s.command_value[seq%8];
-            if(kind==12) { // Kabuki's settings: kept here; ShellUI only reads them
-                char words[129]{}; std::memcpy(words,s.command_text[seq%8],128);
-                unsigned chord=0; int hold=0,sounds=1; char tiles[8]="nqlys..";
-                const int fields=std::sscanf(words,"chord=%u hold=%d sounds=%d tiles=%7s",&chord,&hold,&sounds,tiles);
-                for(char* c=tiles;*c;++c) if(!std::strchr("nqlys.",*c)) *c='.'; // tile codes only
-                if(fields>=3&&__builtin_popcount(chord)>=2) {
-                    char json[160];
-                    std::snprintf(json,sizeof json,"{\"chord\":%u,\"hold_ms\":%d,\"sounds\":%s,\"tiles\":\"%s\"}",chord,
-                                  hold<100?100:hold>5000?5000:hold,sounds?"true":"false",tiles);
-                    const int out=open("/data/custom-overlays/settings.json.partial",O_WRONLY|O_CREAT|O_TRUNC,0644);
-                    const bool ok=out>=0&&write(out,json,std::strlen(json))==(ssize_t)std::strlen(json);
-                    if(out>=0) close(out);
-                    if(ok) rename("/data/custom-overlays/settings.json.partial","/data/custom-overlays/settings.json");
-                    note("SETTINGS saved=%u %s",ok,json);
-                } else note("SETTINGS refused: %.100s",words);
-                continue;
-            }
-            // overlay::Command: play_pause, previous, next, shuffle, repeat, like, volume, seek.
-            char text[96]; text[0]=0;
-            switch(kind) {
-            case 0: std::snprintf(text,sizeof text,"{\"v\":1,\"cmd\":\"play_pause\"}\n"); break;
-            case 1: std::snprintf(text,sizeof text,"{\"v\":1,\"cmd\":\"previous\"}\n"); break;
-            case 2: std::snprintf(text,sizeof text,"{\"v\":1,\"cmd\":\"next\"}\n"); break;
-            case 3: std::snprintf(text,sizeof text,"{\"v\":1,\"cmd\":\"shuffle\",\"on\":%s}\n",value?"true":"false"); break;
-            case 4: std::snprintf(text,sizeof text,"{\"v\":1,\"cmd\":\"repeat\",\"mode\":\"%s\"}\n",value==2?"one":value==1?"all":"off"); break;
-            case 6: std::snprintf(text,sizeof text,"{\"v\":1,\"cmd\":\"volume\",\"value\":%d}\n",value<0?0:value>100?100:value); break;
-            case 7: std::snprintf(text,sizeof text,"{\"v\":1,\"cmd\":\"seek\",\"ms\":%d}\n",value<0?0:value); break;
-            case 9: std::snprintf(text,sizeof text,"{\"v\":1,\"cmd\":\"library\"}\n"); break;
-            case 8: case 10: case 11: break; // with text, below
-            default: note("LINK command kind=%d has no librespot-ps5 equivalent",kind); continue;
-            }
-            std::string with_text;
-            if(kind==8||kind==10||kind==11) {
-                char words[129]{}; std::memcpy(words,s.command_text[seq%8],128);
-                const std::string all=words;
-                const auto space=all.find(' ');
-                const std::string first=all.substr(0,space),second=space==std::string::npos?"":all.substr(space+1);
-                if(!plain_uri(first)||(kind==11&&!plain_uri(second))) { note("LINK command kind=%d refused: not a Spotify URI",kind); continue; }
-                if(kind==8) with_text="{\"v\":1,\"cmd\":\"play_queued\",\"uri\":\""+first+"\",\"index\":"+std::to_string(value<0?0:value)+"}\n";
-                else if(kind==10) with_text="{\"v\":1,\"cmd\":\"open_list\",\"uri\":\""+first+"\"}\n";
-                else with_text="{\"v\":1,\"cmd\":\"play\",\"context\":\""+first+"\",\"track\":\""+second+"\"}\n";
-                std::snprintf(text,sizeof text,"%s","");
-            }
-            if(fd<0) { note("LINK command kind=%d dropped: librespot-ps5 not connected",kind); continue; }
-            const char* out=with_text.empty()?text:with_text.c_str();
-            const auto length=std::strlen(out);
-            if(send(fd,out,length,0)!=(ssize_t)length) { disconnect(true); continue; }
-            note("LINK sent %.*s",(int)length-1,out);
+            service.command(kind,value,text);
+            if(kind==kabuki::kSaveSettings||kind==kabuki::kSaveSlots) note("SETTINGS kind=%d %.100s",kind,text);
         }
     }
 };
