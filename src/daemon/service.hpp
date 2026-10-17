@@ -118,10 +118,12 @@ public:
         providers_.erase(name);
         if (tiles_.size() != before) save_tiles();
     }
+    bool has_provider(const std::string& name) const { return providers_.count(name) != 0; }
     bool owns(const std::string& provider, const std::string& tile) const {
         for (const auto& t : tiles_) if (t.id == tile) return t.provider == provider;
         return false;
     }
+    void set_plugin(const std::string& tile,std::uintptr_t address,const std::string& data,const std::string& error="") { Records r; r.add({"plugin",std::to_string(address),data,error}); write(content_file(tile),r.text()); }
     void set_media(const std::string& tile, const Media& m) { write(content_file(tile), media_records(m).text()); }
     void set_list(const std::string& tile, const List& l) { write(content_file(tile), list_records(l).text()); }
     // Ask the panel to show one of the provider's tiles (it does if one of that provider's is up).

@@ -11,6 +11,8 @@
 
 namespace common_fps::ps5 {
 
+[[nodiscard]] std::uintptr_t map_shellui_plugin(pid_t pid,std::uint8_t* elf,std::uint64_t entry_offset,std::uint64_t symbol_offset) noexcept;
+
 enum class StableInjectionMode : std::uint8_t {
     StartRendererThread,
     ExerciseStagerWithoutThread,

@@ -38,6 +38,7 @@ struct List {
     ListLevel top;
     std::string sub_key;   // the opened row, if any
     ListLevel sub;
+    std::string session; // opaque provider generation; changes reset navigation
 };
 
 inline Records media_records(const Media& m) {
@@ -61,7 +62,7 @@ inline void level_records(Records& r, const ListLevel& l, const char* prefix) {
 inline Records list_records(const List& l) {
     Records r;
     r.add({"list"});
-    r.add({"busy", l.busy});
+    r.add({"busy", l.busy}).add({"session",l.session});
     level_records(r, l.top, "");
     if (!l.sub_key.empty()) { r.add({"sub", l.sub_key}); level_records(r, l.sub, "sub"); }
     return r;
@@ -69,6 +70,8 @@ inline Records list_records(const List& l) {
 
 // What a tile's file holds: which template, and its data.
 struct Content {
+    std::uintptr_t plugin_address=0;
+    std::string plugin_data="{}",plugin_error;
     bool media = false, list = false;
     Media m;
     List l;
@@ -91,8 +94,10 @@ inline Content parse_content(const std::string& text) {
     Content c;
     for (const auto& r : parse_records(text)) {
         const auto& name = field(r, 0);
+        if (name == "plugin") { c.plugin_address=std::uintptr_t(number(r,1)); c.plugin_data=field(r,2); c.plugin_error=field(r,3); continue; }
         if (name == "media") { c.media = true; continue; }
         if (name == "list") { c.list = true; continue; }
+        if (c.list&&name=="session") { c.l.session=field(r,1); continue; }
         if (c.media) {
             auto& m = c.m;
             if (name == "title") m.title = field(r, 1);

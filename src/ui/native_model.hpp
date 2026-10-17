@@ -59,6 +59,11 @@ struct ListView {
 };
 
 struct NativeView {
+    std::uintptr_t plugin_address=0;
+    std::string plugin_data="{}",plugin_error;
+    std::vector<std::string> plugin_live;
+    std::uint32_t plugin_held=0,plugin_pressed=0;
+    std::uint64_t plugin_input_seq=0;
     PlayerState state;        // the shown media card
     ListView list;            // the shown list card
     int tab=kMedia;           // the shown card's kind
@@ -125,6 +130,7 @@ class NativeModel {
     // Navigation: the shown card's tile and the rail cursor's.
     std::string tile,rail,last_shown;
     int control=2,popup=0,option=0,seek_ms=-1,presses=0,sent_ms=-1;
+    std::uint32_t plugin_held=0,plugin_pressed=0; std::uint64_t plugin_input_seq=0;
     std::uint64_t sent_at=0,seek_deadline=0,seek_held_since=0;
     bool focused=false,seek=false,enter_when_loaded=false;
     int volume_asked=-1; std::uint64_t volume_at=0; // shown until the player reports it, or 3 s
@@ -181,7 +187,7 @@ class NativeModel {
     // A card the cursor can go into: a player and Settings always, a list with rows, System never.
     bool enterable(const std::string& id) const {
         const int k=kind(id);
-        if(k==kMedia||k==kSettings) return true;
+        if(k==kMedia||k==kSettings||k==kCustom) return true;
         if(k!=kList) return false;
         bool sub; const auto* l=level(id,sub);
         if(sub) return !l||l->loading||!l->rows.empty(); // an opened list keeps the cursor while it loads
@@ -283,7 +289,16 @@ public:
                 if(!all&&t.id!=tile) continue;
                 auto text=kabuki::read_file(dir+"/"+kabuki::content_file(t.id),262144);
                 auto& last=content_text[t.id];
-                if(text!=last) { last=text; content[t.id]=kabuki::parse_content(text); }
+                if(text!=last) {
+                    auto next=kabuki::parse_content(text);
+                    const auto old=content.find(t.id);
+                    if(next.list&&!next.l.session.empty()&&
+                       (old==content.end()||old->second.l.session!=next.l.session)) {
+                        lists.erase(t.id); // includes an open list whose reply will never arrive
+                        if(t.id==tile)enter_when_loaded=!focused&&next.l.top.loading;
+                    }
+                    last=text;content[t.id]=std::move(next);
+                }
             }
         }
         if(kind(tile)==kStats&&now-last_stats>=500) {
@@ -328,6 +343,7 @@ public:
         // A seek is held until it is heard from there (or the player never gets there).
         if(sent_ms>=0&&((now-sent_at>300&&!s.pending&&std::abs(s.position_ms-sent_ms)<2500)||now-sent_at>12000)) sent_ms=-1;
         suppress&=held; held&=~suppress; pressed&=~suppress;
+        plugin_held=held&0x40f0;plugin_pressed=pressed&0x40f0;++plugin_input_seq;
         if(pressed&0x4000) ++presses;
         const int k=kind(tile);
         if(back) {
@@ -367,6 +383,7 @@ public:
             list_tick(held,pressed,now);
         } else if(k==kMedia) {
             media_tick(held,pressed,now);
+        } else if(k==kCustom) { /* Plugin owns D-pad and Cross; Circle returns to rail above. */
         } else if(pressed&0x20) { focused=false; rail=tile; suppress=held; repeat.reset(); sound(sound::focus_move); }
         // A provider asking for one of its tiles (a chosen song starting: Now Playing), if one
         // of its tiles is the one shown.
@@ -567,6 +584,9 @@ public:
         for(const auto& id:candidates()) v.picks.push_back(view_of(id));
         const auto here=view_of(tile);
         v.header=here.title; v.header_icon=here.icon;
+        for(const auto& t:online)if(t.card==Card::custom)v.plugin_live.push_back(t.id);
+        if(v.tab==kCustom)if(const auto* c=data(tile)) {v.plugin_address=c->plugin_address;v.plugin_data=c->plugin_data;v.plugin_error=c->plugin_error;}
+        v.plugin_held=plugin_held;v.plugin_pressed=plugin_pressed;v.plugin_input_seq=plugin_input_seq;
         if(v.tab==kSettings) v.header=page==1?"Sidebar":"Kabuki Settings";
         if(v.tab==kList) {
             auto self=const_cast<NativeModel*>(this);

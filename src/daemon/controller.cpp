@@ -1,5 +1,7 @@
 /* Manual, reversible ShellUI panel experiment. SPDX-License-Identifier: GPL-3.0-or-later */
 #include "protocol.hpp"
+#include "broker.hpp"
+#include "plugin_file.hpp"
 #include "librespot_adapter.hpp"
 #include "legacy_focus.hpp"
 #include "prologue.hpp"
@@ -142,6 +144,24 @@ static bool stage_fonts() {
     return ok;
 }
 #endif
+// A provider's picture, after its path passed the broker's rules: no symlink below the provider's
+// folder, a regular file of 2 MiB or less that starts like a PNG or JPEG. A file that isn't there
+// yet (or isn't written yet) passes; the worker copes with missing covers.
+static bool art_check(const std::string& dir,const std::string& path) {
+    struct stat info{};
+    for(std::size_t at=dir.size();at<path.size();) {
+        const auto slash=path.find('/',at+1);
+        if(lstat(path.substr(0,slash).c_str(),&info)) return errno==ENOENT;
+        if(S_ISLNK(info.st_mode)) return false;
+        if(slash==std::string::npos) break;
+        at=slash;
+    }
+    if(!S_ISREG(info.st_mode)||info.st_size>2*1024*1024) return false;
+    if(info.st_size<4) return true;
+    const int fd=open(path.c_str(),O_RDONLY); if(fd<0) return true;
+    unsigned char head[4]{}; const bool read_ok=read(fd,head,sizeof head)==(ssize_t)sizeof head; close(fd);
+    return !read_ok||(head[0]==0x89&&head[1]=='P'&&head[2]=='N'&&head[3]=='G')||(head[0]==0xFF&&head[1]==0xD8&&head[2]==0xFF);
+}
 // The panel's link to librespot-ps5 (its control.rs): a loopback socket kept here, outside
 // ShellUI. Each state line is left in player_file, which the worker reads as
 // /user/data/...; commands come from the worker's State ring, which is only ever read.
@@ -151,17 +171,25 @@ static bool stage_fonts() {
 class PlayerLink {
 public:
     PlayerLink() : service("/data/custom-overlays",monotonic_ms),
-                   adapter(service,[this](const std::string& line) { send_line(line); }) {
+                   adapter(service,[this](const std::string& line) { send_line(line); }),
+                   broker(service,broker_hooks(),"/data/custom-overlays/art","0.2.0-rc.1") {
         service.load_settings();
         service.set_system_note("Not running");
     }
-    ~PlayerLink() { disconnect(false); }
+    ~PlayerLink() {
+        disconnect(false);
+        for(auto& peer:peers) close(peer.fd);
+        if(listener>=0) close(listener);
+    }
     void tick(const State& s) {
         const auto now=sceKernelGetProcessTime();
         if(fd<0&&now>=next_attempt) connect_now(now);
         if(fd>=0) receive();
+        serve_providers(now);
         commands(s);
         adapter.tick();
+        broker.tick();
+        flush_providers();
     }
     bool linked() const { return fd>=0; }
 private:
@@ -171,6 +199,104 @@ private:
     int fd=-1; std::uint64_t next_attempt=0; std::string input;
     bool seq_known=false; std::uint32_t seq=0; bool logged_absent=false;
 
+    // The provider broker (src/daemon/broker.hpp, protocol/PROTOCOL.md): other programs' tiles
+    // over loopback. Kept here with the librespot link, ticked from the same loop.
+    static constexpr std::uint16_t provider_port=38590;
+    struct Peer { int id; int fd; std::string out; };
+    kabuki::Broker broker;
+    std::vector<Peer> peers;
+    int listener=-1; std::uint64_t next_listen=0; bool logged_listen=false;
+
+    kabuki::Broker::Hooks broker_hooks() {
+        kabuki::Broker::Hooks h;
+        h.send=[this](int id,const std::string& line) {
+            for(auto& peer:peers) if(peer.id==id) { peer.out+=line; peer.out+='\n'; return; }
+        };
+        h.log=[](const std::string& text) { note("%.200s",text.c_str()); };
+        h.art_ok=art_check;
+        h.native_provider=[this](const std::string& name){if(name=="librespot")adapter.native_takeover();};
+        h.plugin_load=[](const std::string& path)->std::uintptr_t {
+            struct stat st{};if(lstat(path.c_str(),&st)||!S_ISREG(st.st_mode))return 0;
+            static std::map<std::string,std::uintptr_t> mapped;
+            const auto key=path+":"+std::to_string(st.st_size)+":"+std::to_string(st.st_mtime);
+            if(auto it=mapped.find(key);it!=mapped.end())return it->second;
+            if(mapped.size()>=16)return 0;
+            std::vector<std::uint8_t> bytes;std::uint64_t symbol=0;
+            if(!kabuki::plugin_file(path,bytes,symbol))return 0;
+            int mib[]={CTL_KERN,KERN_PROC,KERN_PROC_PROC,0};std::size_t length=0;
+            if(sysctl(mib,4,nullptr,&length,nullptr,0)||!length)return 0;
+            std::vector<unsigned char> processes(length);
+            if(sysctl(mib,4,processes.data(),&length,nullptr,0))return 0;
+            pid_t target=-1;
+            for(std::size_t at=0;at+sizeof(kinfo_proc)<=length;) {
+                const auto* p=reinterpret_cast<const kinfo_proc*>(processes.data()+at);
+                if(!std::strcmp(p->ki_comm,"SceShellUI")){target=p->ki_pid;break;}
+                if(p->ki_structsize<0||std::size_t(p->ki_structsize)<sizeof(kinfo_proc)||std::size_t(p->ki_structsize)>length-at)break;at+=p->ki_structsize;
+            }
+            if(target<0)return 0;
+            const auto entry=reinterpret_cast<const Elf64_Ehdr*>(bytes.data())->e_entry;
+            const auto address=common_fps::ps5::map_shellui_plugin(target,bytes.data(),entry,symbol);
+            if(address)mapped[key]=address;
+            note("PLUGIN mapped=%u size=%zu",address!=0,bytes.size());return address;
+        };
+        return h;
+    }
+    void listen_now(std::uint64_t now) {
+        next_listen=now+2000000;
+        const int l=socket(AF_INET,SOCK_STREAM,0); if(l<0) return;
+        int yes=1; setsockopt(l,SOL_SOCKET,SO_REUSEADDR,&yes,sizeof yes);
+        sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(provider_port); a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+        if(bind(l,reinterpret_cast<sockaddr*>(&a),sizeof a)||listen(l,8)) {
+            if(!logged_listen) { note("BROKER cannot listen on 127.0.0.1:%u errno=%d; retrying every 2 s",provider_port,errno); logged_listen=true; }
+            close(l); return;
+        }
+        fcntl(l,F_SETFL,fcntl(l,F_GETFL)|O_NONBLOCK);
+        listener=l; logged_listen=false;
+        note("BROKER listening on 127.0.0.1:%u",provider_port);
+    }
+    void close_peer(std::size_t index) {
+        broker.closed(peers[index].id);
+        close(peers[index].fd);
+        peers.erase(peers.begin()+(std::ptrdiff_t)index);
+    }
+    void serve_providers(std::uint64_t now) {
+        if(listener<0&&now>=next_listen) listen_now(now);
+        for(;listener>=0;) {
+            const int c=accept(listener,nullptr,nullptr);
+            if(c<0) break;
+            const int id=broker.open();
+            if(id<0) { note("BROKER refused a ninth provider"); close(c); continue; }
+            fcntl(c,F_SETFL,fcntl(c,F_GETFL)|O_NONBLOCK);
+            int yes=1; setsockopt(c,SOL_SOCKET,SO_NOSIGPIPE,&yes,sizeof yes);
+            peers.push_back({id,c,{}});
+        }
+        for(std::size_t i=0;i<peers.size();) {
+            char buffer[4096]; bool gone=false; std::size_t budget=256*1024;
+            const int id=peers[i].id;
+            while(budget&&broker.alive(id)) {
+                const ssize_t n=recv(peers[i].fd,buffer,sizeof buffer,0);
+                if(n>0) { broker.data(id,buffer,(std::size_t)n); budget-=std::min<std::size_t>(budget,(std::size_t)n); continue; }
+                if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) break;
+                gone=true; break;
+            }
+            if(gone) { close_peer(i); continue; }
+            ++i;
+        }
+    }
+    // What the broker said goes out; a provider that can't keep up, or was dropped, is closed.
+    void flush_providers() {
+        for(std::size_t i=0;i<peers.size();) {
+            auto& peer=peers[i];
+            bool failed=false;
+            while(!peer.out.empty()) {
+                const ssize_t n=send(peer.fd,peer.out.data(),peer.out.size(),0);
+                if(n>0) { peer.out.erase(0,(std::size_t)n); continue; }
+                if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) break;
+                failed=true; break;
+            }
+            if(failed||!broker.alive(peer.id)||peer.out.size()>kabuki::kBrokerBuffer) close_peer(i); else ++i;
+        }
+    }
     static std::uint64_t monotonic_ms() {
         timespec t{}; clock_gettime(CLOCK_MONOTONIC,&t);
         return std::uint64_t(t.tv_sec)*1000+t.tv_nsec/1000000;
@@ -723,8 +849,10 @@ int main() {
     int failed=1;
     do {
         std::uint32_t sdk=0; std::size_t len=sizeof sdk;
-        if(sysctlbyname("kern.sdk_version",&sdk,&len,nullptr,0)||len!=sizeof sdk||(sdk&0xffff0000U)!=0x13200000U) {
-            note("unsupported firmware sdk=0x%08x; no bridge started",sdk); break;
+        // Firmware is diagnostic only. Resolve and validate the live methods and
+        // hook prologues below instead of gating experiments by a version list.
+        if(sysctlbyname("kern.sdk_version",&sdk,&len,nullptr,0)||len!=sizeof sdk) {
+            note("firmware SDK query unavailable; continuing with runtime checks");sdk=0;
         }
         pid_t pid=shell_pid(); note("target SceShellUI pid=%d sdk=0x%08x",pid,sdk);
         if(pid<=1||stopping()) break;

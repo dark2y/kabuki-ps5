@@ -255,4 +255,17 @@ StableInjectionResult inject_shellui_stable(
     return result;
 }
 
+std::uintptr_t map_shellui_plugin(pid_t pid,std::uint8_t* elf,std::uint64_t entry_offset,std::uint64_t symbol_offset) noexcept {
+    const auto self=getpid();const auto original=kernel_get_ucred_authid(self);
+    if(!original||kernel_set_ucred_authid(self,kPtraceAuthId))return 0;
+    std::uintptr_t address=0;
+    if(pt_attach(pid)==0) {
+        const auto entry=commonfps_stable_elfldr_load(pid,elf);
+        if(entry>0)address=std::uintptr_t(entry)-entry_offset+symbol_offset;
+        if(pt_detach(pid,0))address=0;
+        (void)kill(pid,SIGCONT);
+    }
+    if(kernel_set_ucred_authid(self,original)||kernel_get_ucred_authid(self)!=original)return 0;
+    return address;
+}
 } // namespace common_fps::ps5

@@ -96,7 +96,10 @@ static void describe_exception(MonoMethod* method,MonoObject* exception) {
     }
     mono_gchandle_free(pin);
 }
+static bool native_plugin_active=false,native_plugin_failed=false;
+static bool native_try(MonoMethod*,void*,void**,MonoObject**);
 static bool invoke(MonoMethod* m,MonoObject* obj,void** args=nullptr,MonoObject** output=nullptr) {
+    if(native_plugin_active)return native_try(m,obj,args,output);
     if(!m) { log("missing method"); return false; }
     auto* owner=mono_method_get_class(m);
     log("UI call %s.%s::%s",mono_class_get_namespace(owner),mono_class_get_name(owner),mono_method_get_name(m));

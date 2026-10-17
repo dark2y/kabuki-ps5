@@ -2,7 +2,9 @@
 
 Usage:
   python3 tools/console.py HOST drives               list USB drives and what is on them
-  python3 tools/console.py HOST install [--usb DIR]  put build/kabuki-ps5.elf on the USB drive
+  python3 tools/console.py HOST install [--usb DIR] [--elf FILE] [--name NAME]
+                                                     put build/kabuki-ps5.elf (or FILE) on the USB drive,
+                                                     as kabuki-ps5.elf (or NAME)
   python3 tools/console.py HOST log [--lines N]      print the end of Kabuki's log
   python3 tools/console.py HOST stop                 ask a running Kabuki to stop
   python3 tools/console.py HOST clear-stop           remove the stop request before the next run
@@ -52,6 +54,8 @@ def main():
     parser.add_argument("--port", type=int, default=2121)
     parser.add_argument("--usb", help="the USB drive to install to, for example /mnt/usb0")
     parser.add_argument("--lines", type=int, default=60)
+    parser.add_argument("--elf", type=Path, default=PAYLOAD, help="the file to install")
+    parser.add_argument("--name", default="kabuki-ps5.elf", help="its name on the drive")
     args = parser.parse_args()
     if not args.host:
         parser.error("give the console's address, or set KABUKI_CONSOLE")
@@ -64,7 +68,9 @@ def main():
             found = [m for m in MARKERS if m in entries]
             print(drive, "holds " + ", ".join(found) if found else "")
     elif args.command == "install":
-        data = PAYLOAD.read_bytes()
+        data = args.elf.read_bytes()
+        if "/" in args.name or not args.name.endswith(".elf"):
+            sys.exit("--name is a file name ending in .elf")
         if args.usb:
             drive = args.usb
         else:
@@ -72,14 +78,14 @@ def main():
             if len(drives) != 1:
                 sys.exit(f"Expected one USB drive holding {' or '.join(MARKERS)}, found {drives or 'none'}; use --usb")
             drive = drives[0]
-        target = f"{drive}/kabuki-ps5.elf"
+        target = f"{drive}/{args.name}"
         ftp.storbinary(f"STOR {target}.partial", io.BytesIO(data))
         try:
             ftp.delete(target)
         except (error_perm, error_reply):
             pass
         ftp.rename(f"{target}.partial", target)
-        size = listing(ftp, drive).get("kabuki-ps5.elf")
+        size = listing(ftp, drive).get(args.name)
         print(target, len(data), "bytes", "ok" if size == len(data) else f"SIZE MISMATCH ({size})")
         if size != len(data):
             sys.exit(1)

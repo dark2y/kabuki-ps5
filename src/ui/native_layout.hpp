@@ -220,11 +220,11 @@ template <class B> class Layout {
     W popup_, popup_face_, popup_title_, popup_value_, popup_hint_, vol_icon_, vol_base_, vol_fill_, vol_knob_;
     W opt_focus_, opt_icon_[2], opt_label_[2], opt_value_, sw_track_, sw_check_, sw_knob_;
     // System: readings in two sections.
-    static constexpr int kStats = 8;
-    W sys_heading_[2], sys_label_[kStats], sys_value_[kStats], sys_base_[2], sys_fill_[2], sys_sub_;
+    static constexpr int kStatRows = 8;
+    W sys_heading_[2], sys_label_[kStatRows], sys_value_[kStatRows], sys_base_[2], sys_fill_[2], sys_sub_;
     // Settings: three rows (shortcut, hold time, sounds), the hold-time list, the version.
-    static constexpr int kSettings = 4, kChoices = 6;
-    W set_focus_, set_label_[kSettings], set_value_[kSettings], set_note_, set_track_, set_check_, set_knob_, set_chevron_;
+    static constexpr int kSettingRows = 4, kChoices = 6;
+    W set_focus_, set_label_[kSettingRows], set_value_[kSettingRows], set_note_, set_track_, set_check_, set_knob_, set_chevron_;
     W side_icon_[kSlots], side_label_[kSlots], side_more_; // the sidebar page's slots; the arrow into it
     W pick_, pick_face_, pick_focus_, pick_label_[kChoices], pick_tick_[kChoices], version_, version_low_, link_;
     W side_star_; // the first slot's tile opens with the panel
@@ -271,6 +271,7 @@ template <class B> class Layout {
     float time(std::uint64_t now, std::uint64_t at, float ms) const { return float(now - at) / (ms * 1000); }
 
 public:
+    std::function<Focus(W&,const NativeView&,std::uint64_t,float)> plugin;
     explicit Layout(B& backend) : b(backend) {}
 
     bool create() {
@@ -385,7 +386,7 @@ public:
             if (!b.label(sys_heading_[i], c, text_box(kPad, i ? kSysConsole : kListTop + 18, kContentW, kTimeSize), kTimeSize, bold, kSecondary,
                          left, ellipsis, i ? "Console" : "Performance"))
                 return false;
-        for (int i = 0; i < kStats; ++i) {
+        for (int i = 0; i < kStatRows; ++i) {
             const float base = stat_baseline(i), size = i < 4 ? 22 : 20;
             if (!b.label(sys_label_[i], c, text_box(kPad, base, 240, size), size, normal, i < 4 ? kWhite : kSecondary, left, ellipsis, stat_names[i]) ||
                 !b.label(sys_value_[i], c, text_box(kCardW - kPad - 260, base, 260, size), size, light, kWhite, right, ellipsis, ""))
@@ -403,7 +404,7 @@ public:
         const char* setting_names[] = {"Open shortcut", "Hold to open", "Interface sounds", "Sidebar"};
         if (!b.skin(set_focus_, c, {12, kListTop, kCardW - 24, kSettingH - 6}, rounded, 10)) return false;
         b.tint(set_focus_, kWhite, 34 / 255.f);
-        for (int i = 0; i < kSettings; ++i) {
+        for (int i = 0; i < kSettingRows; ++i) {
             const float base = kListTop + i * kSettingH + (kSettingH - 6) / 2 + 9;
             if (!b.label(set_label_[i], c, text_box(kPad, base, 260, 24), 24, normal, kWhite, left, ellipsis, setting_names[i]) ||
                 !b.label(set_value_[i], c, text_box(kCardW - kPad - 230, base, i == 1 || i == 3 ? 196 : 230, 24), 24, light, kSecondary, right, ellipsis, ""))
@@ -418,8 +419,8 @@ public:
              // Kabuki's version: the bottom left of the screen while the panel is open.
              // With Settings showing, bottom left of the screen: Kabuki's version and where it comes from.
              b.image(side_more_, c, {kCardW - kPad - 28, kListTop + 3 * kSettingH + (kSettingH - 6) / 2 - 14, 28, 28}, b.icon("iconid_arrow_right")) &&
-             b.label(version_, b.screen(), text_box(48, 1080 - 66, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v0.1.0") &&
-             b.label(version_low_, b.screen(), text_box(48, 1080 - 38, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v0.1.0") &&
+             b.label(version_, b.screen(), text_box(48, 1080 - 66, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v0.2.0-rc.1") &&
+             b.label(version_low_, b.screen(), text_box(48, 1080 - 38, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v0.2.0-rc.1") &&
              b.image(side_star_, c, {0, 0, 22, 22}, b.icon("iconid_rating")) &&
              b.label(link_, b.screen(), text_box(48, 1080 - 38, 500, 20), 20, normal, kSecondary, left, ellipsis,
                      "github.com/stupiditytries") &&
@@ -649,6 +650,7 @@ private:
         lists(v, now, dt, playing);
         system(v);
         settings(v, now, dt);
+        if(plugin) { const auto f=plugin(card_,v,now,dt); if(v.tab==kCustom)want_=f; }
     }
 
     // Settings: the shortcut (recorded by holding the new buttons together), the hold time (a list

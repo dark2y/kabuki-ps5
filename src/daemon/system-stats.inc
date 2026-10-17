@@ -42,7 +42,9 @@ private:
     std::uint32_t idle_tid[16]{}; int idle_found=0;
     std::uint64_t next=0;
     float cpu=-1; int cpu_temp=-1,soc_temp=-1,mem_used=-1,mem_total=-1;
-    int dce=-2; std::uint64_t flips=0,flips_at=0;
+    int dce=-1; std::uint64_t flips_at=0;
+    std::uint64_t counters[12]{};int streak[12]{};float previous_rate[12]{};
+    int selected_counter=-1;unsigned fps_failures=0;
     float fps_seen[5]={-1,-1,-1,-1,-1}; int fps_at=0,samples=0;
 
     void step(const char* name) { if(samples==0) note("SYSTEM step %s",name); }
@@ -128,20 +130,54 @@ private:
         if(sample>=0) {
             unsigned char b[64]{}; const auto n=read(sample,b,sizeof b); close(sample);
             std::uint32_t magic=0; float value=0; std::memcpy(&magic,b,4); std::memcpy(&value,b+16,4);
-            if(n>=48&&magic==0x4F465053u&&b[12]&&value>0&&value<=245) return value;
+            if(n>=20&&magic==0x4F465053u&&b[12]&&value>0&&value<=245) return value;
         }
-        if(dce==-2) dce=open("/dev/dce",O_RDWR);
-        if(dce<0) return -1;
+        // DCE access can require the debugger credential already used by Kabuki's
+        // loader. Keep it only around open/ioctl, restore and verify on every path.
+        const auto auth=kernel_get_ucred_authid(getpid());
+        bool privileged=false;
+        const auto elevate=[&] {if(privileged)return true;if(!auth)return false;
+            privileged=kernel_set_ucred_authid(getpid(),0x4800000000010003ULL)==0;return privileged;};
+        if(dce<0) {
+            dce=open("/dev/dce",O_RDWR);
+            if(dce<0&&elevate()){dce=open("/dev/dce",O_RDWR);if(dce<0)dce=open("/dev/dce",O_RDONLY);}
+        }
         struct { std::uint64_t selector,mask,output,reserved[3]; } arg{};
-        unsigned char out[0x60]{};
-        arg.selector=0x10000000AULL; arg.mask=0x8000000000ULL; arg.output=(std::uint64_t)out;
-        if(ioctl(dce,0x80308217UL,&arg)<0) { close(dce); dce=-1; return -1; }
-        std::uint64_t count=0; std::memcpy(&count,out+8,8);
-        float rate=-1;
-        if(flips_at&&now>flips_at&&count>=flips) rate=float((count-flips)/((now-flips_at)/1e6));
-        flips=count; flips_at=now;
-        return rate>=1&&rate<=245?rate:-1;
+        alignas(16) std::uint64_t current[12]{};
+        arg.selector=0x10000000AULL;arg.mask=0x8000000000ULL;arg.output=(std::uint64_t)current;
+        const auto query=[&] {return dce>=0&&(ioctl(dce,0x80308217UL,&arg)==0||ioctl(dce,0xffffffff80308217UL,&arg)==0);};
+        bool ok=query();if(!ok&&elevate())ok=query();const int error=errno;
+        if(privileged&&(kernel_set_ucred_authid(getpid(),auth)||kernel_get_ucred_authid(getpid())!=auth)) {
+            note("SYSTEM FPS auth restoration failed; sampling disabled");
+            interrupted=SIGTERM;ok=false;
+        }
+        if(!ok) {
+            if(dce>=0)close(dce);dce=-1;flips_at=0;selected_counter=-1;
+            if(++fps_failures==1||fps_failures%15==0)note("SYSTEM FPS DCE unavailable errno=%d retry=%u",error,fps_failures);
+            return -1;
+        }
+        if(!flips_at||now<=flips_at||now-flips_at>2500000) {
+            std::memcpy(counters,current,sizeof counters);flips_at=now;
+            std::fill(std::begin(streak),std::end(streak),0);
+            std::fill(std::begin(fps_seen),std::end(fps_seen),-1);return -1;
+        }
+        float rates[12]{};
+        for(int i=0;i<12;++i) {
+            const double rate=current[i]>=counters[i]?double(current[i]-counters[i])*1e6/double(now-flips_at):0;
+            rates[i]=rate>=1&&rate<=245?float(rate):-1;
+            streak[i]=rates[i]>=0&&std::fabs(rates[i]-previous_rate[i])<=12?streak[i]+1:0;previous_rate[i]=rates[i];
+        }
+        if(rates[1]>=0)selected_counter=1;
+        else if(selected_counter<0||rates[selected_counter]<0) {
+            selected_counter=-1;
+            for(int i=0;i<12;++i)if(streak[i]>=2){selected_counter=i;break;}
+        }
+        std::memcpy(counters,current,sizeof counters);flips_at=now;
+        if(selected_counter<0)return -1;
+        if(fps_failures||samples<3)note("SYSTEM FPS DCE counter=%d fps=%.1f restored=%u",selected_counter,rates[selected_counter],!privileged||kernel_get_ucred_authid(getpid())==auth);
+        fps_failures=0;return rates[selected_counter];
     }
+
     float fps_average() const {
         float sum=0; int n=0;
         for(float f:fps_seen) if(f>=0) { sum+=f; ++n; }

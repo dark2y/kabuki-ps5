@@ -32,6 +32,10 @@ python3 preview/native_preview.py                    # then open http://127.0.0.
 - **Address:** use `127.0.0.1`, not `localhost`, which can add a delay of hundreds of
   milliseconds. Keep one tab open, because several tabs drive the same panel.
 - **Live data:** `--console <ip>` mirrors a console's player state.
+- **Providers:** the preview listens on `127.0.0.1:38590` like the console. Run
+  `python3 tools/mock_provider.py` to add a player and a library tile, or point a payload built
+  against `sdk/c/kabuki.h` at it. Set `KABUKI_PREVIEW_OUT` to keep a second preview's build and
+  files apart from the first.
 - **Snapshots:** in the page's console, `snapshot()` saves a 4K PNG of the current frame to
   `build/native-preview/snapshot.png`.
 - **Reloading:** the preview rebuilds itself when the sources change. Restart the server to

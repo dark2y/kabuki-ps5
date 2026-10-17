@@ -43,8 +43,8 @@ worker only reads small, validated files and a shared-memory ring, and draws.
 - **On a PC:** the backend in `preview/native_preview.cpp` records them as JSON for the page to
   draw.
 
-So the preview shows exactly what the console will, and most interface work can be done
-without a console.
+The preview shares the layout and navigation code with the console. Rendering and system
+readings still need console validation.
 
 ## Data on the console
 
@@ -64,11 +64,22 @@ Everything lives in `/data/custom-overlays` (to be renamed `/data/kabuki`):
 The worker reads only `.rec` files: simple tab-separated records (`src/common/records.hpp`). All
 JSON is parsed in the daemon.
 
-## Providers (where this is going)
+## Providers
 
-Tiles have 6-character ids and are registered by their providers; Kabuki's own `KBKSYS` (System)
-and `KBKSET` (Settings, which can never be removed) always come last by default. Until
-librespot-ps5 registers its own tiles, the daemon's adapter (`src/daemon/librespot_adapter.hpp`)
-does it for librespot while its control channel on `127.0.0.1:38574` answers. The plan is a small, versioned protocol that any homebrew can use to add
-tiles. A tile either sends data to one of Kabuki's card templates, or describes its own card as
-a tree of widgets. Either way the card is only data: no third-party code runs inside SceShellUI.
+Any program on the console can add tiles to the panel through the daemon's broker, a small
+versioned protocol on `127.0.0.1:38590` (see `protocol/PROTOCOL.md`). A tile either sends data to
+one of Kabuki's card templates (`media`, `list`), or ships a native plugin. Either way
+Kabuki draws the card, and everything a provider sends is checked in the daemon.
+
+| Part | Where |
+|---|---|
+| The protocol | `protocol/PROTOCOL.md` |
+| The broker: parsing, checks, limits, one `Service` provider per client | `src/daemon/broker.hpp` |
+| Its sockets, ticked with the daemon's loop | `PlayerLink` in `src/daemon/controller.cpp` |
+| A C client | `sdk/c/kabuki.h` |
+| A small payload using it | `examples/hello-tile/` |
+| A provider for the preview | `tools/mock_provider.py` |
+
+`src/daemon/librespot_adapter.hpp` supports older receivers through their control channel on
+`127.0.0.1:38574`. A receiver registering as the native `librespot` provider takes over those
+tiles and disables the legacy adapter, so the two transports cannot duplicate the music UI.

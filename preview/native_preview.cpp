@@ -7,11 +7,24 @@
 //
 // Usage: native_preview DATA_DIR FONT_DIR
 // Each line read: a JSON object: held, pressed (pad bits as the console's), circle, open (0/1),
-// service (0: only mirror files someone else writes), linked (librespot running), lines (from it).
-// Each line written: the frame as JSON (widgets, commands, librespot's commands, now_ms).
+// service (0: only mirror files someone else writes), linked (librespot running), lines (from it),
+// providers (connections to the broker, in order: {"conn":N,"open":1}, {"conn":N,"data":"..."},
+// {"conn":N,"close":1}).
+// Each line written: the frame as JSON (widgets, commands, librespot's commands, now_ms, and the
+// broker's lines to its connections in "to_providers" and the connections it dropped in "dropped").
 // Widgets carry their skin pixels the first time they are sent.
 #define _CRT_SECURE_NO_WARNINGS
 #include "native_layout.hpp"
+#include "plugin_host.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+#include "broker.hpp"
 #include "librespot_adapter.hpp"
 #define STB_TRUETYPE_IMPLEMENTATION
 #include <stb_truetype.h>
@@ -129,6 +142,8 @@ public:
     // The console's glass focus is PUI's own; the preview keeps the layout's rings.
     bool focus(const overlay::native::Focus& f, int) { focused = f; return false; }
     overlay::native::Focus focused{};
+    template<class F>bool plugin_scope(F f){return f();}
+    void plugin_remove(Widget& w){if(w.id>=0){nodes[std::size_t(w.id)].visible=false;w.id=-1;}}
 
     nlohmann::json frame() {
         auto list = nlohmann::json::array();
@@ -183,6 +198,27 @@ int main(int argc, char** argv) {
     kabuki::Service service(data, [&now] { return now; });
     auto to_librespot = nlohmann::json::array();
     kabuki::LibrespotAdapter adapter(service, [&to_librespot](const std::string& line) { to_librespot.push_back(line); });
+    // The provider broker, as the console's daemon runs it; the preview's Python holds the sockets.
+    std::map<int, int> broker_ids; // connection -> broker client
+    auto to_providers = nlohmann::json::array();
+    kabuki::Broker::Hooks hooks;
+    hooks.send = [&](int id, const std::string& line) {
+        for (const auto& [conn, client] : broker_ids)
+            if (client == id) { to_providers.push_back({{"conn", conn}, {"line", line}}); return; }
+    };
+    hooks.log = [](const std::string& text) { std::cerr << text << '\n'; };
+    hooks.native_provider=[&](const std::string& name){if(name=="librespot")adapter.native_takeover();};
+    hooks.plugin_load=[](const std::string& path)->std::uintptr_t {
+        const char* root=std::getenv("KABUKI_PLUGIN_PREVIEW_ROOT");if(!root)return 0;
+        const auto name=path.substr(path.find_last_of('/')+1);
+        const auto base=std::string(root)+"/"+name.substr(0,name.size()-4);
+#ifdef _WIN32
+        auto h=LoadLibraryA((base+".dll").c_str());return h?reinterpret_cast<std::uintptr_t>(GetProcAddress(h,"kabuki_plugin_v1")):0;
+#else
+        auto* h=dlopen((base+".so").c_str(),RTLD_NOW|RTLD_LOCAL);return h?reinterpret_cast<std::uintptr_t>(dlsym(h,"kabuki_plugin_v1")):0;
+#endif
+    };
+    kabuki::Broker broker(service, hooks, "/data/kabuki/art", "0.2.0-rc.1");
     bool run_service = true, started = false;
     auto commands = nlohmann::json::array();
     overlay::NativeModel model([&](int kind, int value, const char* text) {
@@ -191,6 +227,9 @@ int main(int argc, char** argv) {
     });
     overlay::native::Layout<Recorder> layout(recorder);
     if (!layout.create()) { std::cerr << "layout create failed\n"; return 1; }
+    kabuki::PluginHost<Recorder> plugins(recorder);
+    plugins.action=[&](const std::string& tile,const std::string& id,int value){service.command(kabuki::kTileAction,value,tile+"\t"+id+"\t");};
+    layout.plugin=[&](Recorder::Widget& card,const overlay::NativeView& v,std::uint64_t now,float dt){return plugins.frame(card,v,now,dt);};
     bool open = false, back = false;
     std::uint64_t opening = 0, last_stats = 0;
     std::string input;
@@ -211,6 +250,24 @@ int main(int argc, char** argv) {
             if (in.contains("lines") && in["lines"].is_array())
                 for (const auto& l : in["lines"]) if (l.is_string()) adapter.line(l.get<std::string>());
             adapter.tick();
+            if (in.contains("providers") && in["providers"].is_array()) {
+                for (const auto& e : in["providers"]) {
+                    const int conn = e.value("conn", -1);
+                    if (e.contains("open")) {
+                        const int id = broker.open();
+                        if (id >= 0) broker_ids[conn] = id;
+                        else to_providers.push_back({{"conn", conn}, {"close", true}});
+                    } else if (!broker_ids.count(conn)) {
+                        continue;
+                    } else if (e.contains("data") && e["data"].is_string()) {
+                        broker.data(broker_ids[conn], e["data"].get<std::string>());
+                    } else if (e.contains("close")) {
+                        broker.closed(broker_ids[conn]);
+                        broker_ids.erase(conn);
+                    }
+                }
+            }
+            broker.tick();
             // Sample readings for the System card (the console's daemon reads its own).
             if (now - last_stats >= 500) {
                 last_stats = now;
@@ -241,12 +298,20 @@ int main(int argc, char** argv) {
         }
         layout.frame(model.view(), open, now_us, opening);
         const auto view = model.view();
+        for (auto it = broker_ids.begin(); it != broker_ids.end();) { // dropped for misbehaving: closed after their last lines
+            if (broker.alive(it->second)) { ++it; continue; }
+            to_providers.push_back({{"conn", it->first}, {"close", true}});
+            broker.closed(it->second);
+            it = broker_ids.erase(it);
+        }
         nlohmann::json out = {{"now_ms", now}, {"open", open}, {"commands", commands}, {"librespot", to_librespot},
+                              {"to_providers", to_providers},
                               {"sounds", model.take_sounds()}, {"widgets", recorder.frame()},
                               {"view", {{"tab", view.tab}, {"tile", view.tile}, {"rail", view.rail_at}, {"focused", view.focused},
                                         {"control", view.control}, {"seek", view.seek}, {"popup", view.popup}}}};
         commands = nlohmann::json::array();
         to_librespot = nlohmann::json::array();
+        to_providers = nlohmann::json::array();
         std::cout << out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) << '\n' << std::flush;
     }
     return 0;

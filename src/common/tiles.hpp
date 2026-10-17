@@ -56,7 +56,7 @@ inline Card card_from_name(const std::string& s) {
     if (s == "list") return Card::list;
     if (s == "stats") return Card::stats;
     if (s == "settings") return Card::settings;
-    if (s == "custom") return Card::custom;
+    if (s == "custom" || s == "plugin") return Card::custom;
     return Card::none;
 }
 

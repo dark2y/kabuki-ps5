@@ -23,9 +23,10 @@ public:
         : s_(service), send_(std::move(send)) {}
 
     bool linked() const { return linked_; }
+    void native_takeover(){if(linked_){s_.remove_provider(kProvider);linked_=false;}native_=true;}
 
     void connected() {
-        if (linked_) return;
+        if (linked_||native_) return;
         linked_ = true;
         Service::Provider p;
         p.action = [this](const std::string& tile, const std::string& action, const std::string& key, int value) { act(tile, action, key, value); };
@@ -48,6 +49,7 @@ public:
 
     // One line from librespot: its state, its library, or an open list's tracks.
     void line(const std::string& text) {
+        if(native_)return;
         auto j = nlohmann::json::parse(text, nullptr, false);
         if (!j.is_object()) return;
         if (j.contains("library") && j["library"].is_object()) {
@@ -69,6 +71,7 @@ public:
 private:
     Service& s_;
     std::function<void(const std::string&)> send_;
+    bool native_=false;
     bool linked_ = false, library_known_ = false, saw_pending_ = false;
     nlohmann::json state_, library_, tracks_, frozen_;
     std::uint64_t state_at_ = 0, library_asked_ = 0, busy_since_ = 0;

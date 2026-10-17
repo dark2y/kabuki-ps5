@@ -27,16 +27,18 @@ if [[ ! -f $json/nlohmann/json.hpp ]]; then
 fi
 out="$repo/build/kabuki"
 mkdir -p "$out"
-common=(-O2 -march=znver2 -fPIC -Wall -Wextra -ffile-prefix-map="$repo"=.
+common=(-Oz -ffunction-sections -fdata-sections -march=znver2 -fPIC -Wall -Wextra -ffile-prefix-map="$repo"=.
         -I"$repo/src/common" -I"$repo/src/loader"
         -DPROBE_INPUT -DPROBE_TOGGLE -DPROBE_NATIVE)
 
 # The worker that runs inside ShellUI: PUI widgets, input, the interface.
 "$sdk/bin/prospero-clang++" "${common[@]}" -Werror -Wno-deprecated-literal-operator -std=c++20 \
     -I"$repo/src/shellui" -I"$repo/src/ui" \
-    -shared -Wl,-e,elf_main -Wl,-Bsymbolic -Wl,--hash-style=sysv -Wl,--eh-frame-hdr \
+    -shared -Wl,--gc-sections -Wl,-e,elf_main -Wl,-Bsymbolic -Wl,--hash-style=sysv -Wl,--eh-frame-hdr \
     -Wl,-T,"$repo/src/shellui/constructors.ld" \
     "$repo/src/shellui/worker.cpp" -lScePad -lmonosgen-2.0 -lkernel_sys -lSceLibcInternal -o "$out/worker.elf"
+
+"$sdk/bin/prospero-strip" --strip-unneeded "$out/worker.elf"
 
 # Embedded in the payload, with the loader's small method-lookup helper.
 python3 "$repo/tools/embed.py" "$out/worker.elf" "$out/blob.c"
@@ -58,8 +60,8 @@ fi
 "$sdk/bin/prospero-clang++" "${daemon[@]}" -Werror -Wno-deprecated-literal-operator -std=c++20 "$repo/src/daemon/controller.cpp" \
     "$repo/src/loader/stable_shellui_injector.cpp" "$repo/src/loader/remote_call.cpp" \
     "$out/pt.o" "$out/elfldr.o" "$out/blob.o" -lSceSystemService -lkernel_sys -lSceLibcInternal \
-    -o "$repo/build/kabuki-ps5.elf"
-"$sdk/bin/prospero-strip" --strip-debug "$repo/build/kabuki-ps5.elf"
+    -Wl,--gc-sections -o "$repo/build/kabuki-ps5.elf"
+"$sdk/bin/prospero-strip" --strip-unneeded "$repo/build/kabuki-ps5.elf"
 
 # Payloads much over 2 MiB have failed to start on the console without any message.
 size=$(stat -c %s "$repo/build/kabuki-ps5.elf")

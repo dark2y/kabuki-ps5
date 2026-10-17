@@ -89,7 +89,7 @@ static void* native_data_thread(void*) {
 
 // One PUI widget and what was last set on it (a value is only set again when it changes).
 struct NativeWidget {
-    std::uint32_t handle=0,asset=0,texture=0,font=0,transform=0;
+    std::uint32_t handle=0,asset=0,texture=0,font=0,transform=0,parent=0;
     std::string text,uri,measured_text;
     std::string missing; std::uint64_t missing_at=0; // a picture file not there (yet): looked for again in 1 s
     float measured=0;
@@ -133,6 +133,7 @@ static MonoMethod* native_exact(MonoClass* type,const char* name,std::initialize
     log("SHELLUI missing exact method %s.%s",mono_class_get_name(type),name); return nullptr;
 }
 static bool native_invoke(MonoMethod* m,void* object,void** args=nullptr) {
+    if(native_plugin_active)return native_try(m,object,args,nullptr);
     if(!m) { native_ok=false; return false; }
     MonoObject* exception=nullptr;
     mono_runtime_invoke(m,object,args,&exception);
@@ -142,10 +143,10 @@ static bool native_invoke(MonoMethod* m,void* object,void** args=nullptr) {
 // For optional features (the pop's scale, measuring text): a failure is logged and the
 // panel carries on without it.
 static bool native_try(MonoMethod* m,void* object,void** args,MonoObject** out=nullptr) {
-    if(!m) return false;
+    if(!m) {if(native_plugin_active)native_plugin_failed=true;return false;}
     MonoObject* exception=nullptr;
     auto* value=mono_runtime_invoke(m,object,args,&exception);
-    if(exception) { describe_exception(m,exception); return false; }
+    if(exception) { describe_exception(m,exception); if(native_plugin_active)native_plugin_failed=true; return false; }
     if(out) *out=value;
     return true;
 }
@@ -186,6 +187,7 @@ static void native_tint(NativeWidget& image,float r,float g,float b,float a=1) {
     image.red=r; image.green=g; image.blue=b; image.tint_alpha=a;
 }
 static bool native_append(NativeWidget& box,MonoClass* type,MonoObject* parent,float x,float y,float w,float h) {
+    box.parent=mono_gchandle_new(parent,0);
     box.handle=object(type);
     if(!box.handle) return false;
     auto* obj=mono_gchandle_get_target(box.handle);
@@ -705,6 +707,19 @@ static void bind_sounds(MonoImage* pui) {
 // native_layout.hpp's backend: PUI Label, ImageBox and Panel widgets.
 struct NativeBackend {
     using Widget=NativeWidget;
+    template<class F> bool plugin_scope(F fn) {
+        const bool saved=native_ok, active=native_plugin_active, failed=native_plugin_failed;
+        native_plugin_active=true;native_plugin_failed=false;
+        const bool result=fn();
+        const bool local_failed=native_plugin_failed||!native_ok;
+        native_plugin_active=active;native_plugin_failed=failed||local_failed;native_ok=saved;
+        return result&&!local_failed;
+    }
+    void plugin_remove(Widget& w) {
+        if(w.handle) {auto* obj=of(w);if(w.parent) {void* args[]={obj};native_try(method(widget_class,"RemoveChild",1),mono_gchandle_get_target(w.parent),args);}
+            native_try(method(mono_object_get_class(obj),"Dispose",0),obj,nullptr);native_release_asset(w);}
+        for(auto h:{w.font,w.transform,w.handle,w.parent})if(h)mono_gchandle_free(h);w=Widget{};
+    }
     using Box=overlay::native::Box;
     using Rgb=overlay::native::Rgb;
     static MonoObject* of(Widget& w) { return mono_gchandle_get_target(w.handle); }
@@ -733,7 +748,9 @@ struct NativeBackend {
     std::string fallback_art() { return native_fallback_art(); }
     bool focus(const overlay::native::Focus& f,int presses) { return native_focus(f,presses); }
 };
+#include "plugin_host.hpp"
 static NativeBackend native_backend;
+static kabuki::PluginHost<NativeBackend>* native_plugins=nullptr;
 static overlay::native::Layout<NativeBackend>* native_layout=nullptr;
 
 static bool bind_native(MonoImage* pui) {
@@ -809,6 +826,11 @@ static bool create_native(MonoObject*,float width,float height) {
     log("SHELLUI glass focus mode=%s",ui3_mode==1?"self":ui3_mode==2?"system":"off");
     native_layout=new(std::nothrow) overlay::native::Layout<NativeBackend>(native_backend);
     if(!native_layout||!native_layout->create()) return false;
+    native_plugins=new(std::nothrow) kabuki::PluginHost<NativeBackend>(native_backend);
+    if(!native_plugins)return false;
+    native_plugins->action=[](const std::string& tile,const std::string& id,int value) {overlay_console::send_command(kabuki::kTileAction,value,(tile+"\t"+id+"\t").c_str());};
+    native_plugins->timing=[](const std::string& tile,std::uint64_t us){static std::uint64_t last=0;const auto now=sceKernelGetProcessTime();if(now-last>5000000){last=now;log("PLUGIN frame tile=%s us=%llu",tile.c_str(),(unsigned long long)us);}};
+    native_layout->plugin=[](NativeWidget& card,const overlay::NativeView& v,std::uint64_t now,float dt){return native_plugins->frame(card,v,now,dt);};
     log("SHELLUI created native control centre screen=%.0fx%.0f unit=%.3f",width,height,native_unit);
     native_sound_preload(); // loaded before the first sound is wanted
     return native_ok;
@@ -879,11 +901,12 @@ static void native_ui() {
     }
 }
 static void dispose_native() {
+    delete native_plugins;native_plugins=nullptr;
     // Scene.Dispose owns its widget tree; free our pins only after scene detachment.
     if(native_layout) {
         native_layout->each([](NativeWidget& w) {
             native_release_asset(w);
-            for(auto h:{w.font,w.transform,w.handle}) if(h) mono_gchandle_free(h);
+            for(auto h:{w.font,w.transform,w.handle,w.parent}) if(h) mono_gchandle_free(h);
             w=NativeWidget{};
         });
         delete native_layout; native_layout=nullptr;

@@ -13,11 +13,13 @@ Then open http://127.0.0.1:8765. Keys: Space open/close, arrows, Enter = Cross,
 Backspace/Esc = Circle, Q = L1, E = R1, S = Square. A gamepad works too.
 """
 import argparse
+import codecs
 import ftplib
 import io
 import json
 import mimetypes
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -27,7 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-OUT = REPO / 'build' / 'native-preview'
+OUT = Path(os.environ['KABUKI_PREVIEW_OUT']) if os.environ.get('KABUKI_PREVIEW_OUT') else REPO / 'build' / 'native-preview'
 DATA = OUT / 'data'
 COVERS = OUT / 'covers'
 EXE = OUT / ('native_preview.exe' if os.name == 'nt' else 'native_preview')
@@ -38,7 +40,8 @@ REFS = {'screens': REPO / 'build' / 'screens', 'shots': REPO / 'build' / 'shots'
 PAGE = Path(__file__).with_name('native_preview.html')
 SOURCES = [REPO / 'preview/native_preview.cpp', REPO / 'src/ui/native_layout.hpp', REPO / 'src/ui/native_model.hpp',
            REPO / 'src/ui/player.hpp', REPO / 'src/common/records.hpp', REPO / 'src/common/tiles.hpp',
-           REPO / 'src/common/content.hpp', REPO / 'src/daemon/service.hpp', REPO / 'src/daemon/librespot_adapter.hpp']
+           REPO / 'src/common/content.hpp', REPO / 'src/daemon/service.hpp', REPO / 'src/daemon/librespot_adapter.hpp',
+           REPO / 'src/daemon/broker.hpp', REPO / 'src/ui/plugin_host.hpp', REPO / 'sdk/plugin/kabuki_plugin.h']
 
 
 def build():
@@ -63,9 +66,9 @@ class Host:
         self.now = 0
         self.skins = {}
 
-    def step(self, held, pressed, circle, open_, lines=(), linked=True, service=True):
+    def step(self, held, pressed, circle, open_, lines=(), linked=True, service=True, providers=()):
         message = dict(held=held, pressed=pressed, circle=circle, open=open_, lines=list(lines),
-                       linked=1 if linked else 0, service=1 if service else 0)
+                       linked=1 if linked else 0, service=1 if service else 0, providers=list(providers))
         with self.lock:
             self.proc.stdin.write(json.dumps(message) + '\n')
             self.proc.stdin.flush()
@@ -76,6 +79,70 @@ class Host:
             if 'pixels' in w:
                 self.skins[w['id']] = {k: w.pop(k) for k in ('pw', 'ph', 'pixels')}
         return frame
+
+
+class Providers:
+    """The provider broker's port (127.0.0.1:38590) for the preview. The sockets are here; the
+    broker itself runs in the host, the console daemon's own code (src/daemon/broker.hpp). Try it
+    with tools/mock_provider.py or a payload built against sdk/c/kabuki.h."""
+    PORT = 38590
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.events = []  # for the host, in order: {conn, open|data|close}
+        self.conns = {}
+        self.count = 0
+        self.server = socket.socket()
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server.bind(('127.0.0.1', self.PORT))
+        self.server.listen(8)
+        threading.Thread(target=self.accept, daemon=True).start()
+
+    def accept(self):
+        while True:
+            conn, _ = self.server.accept()
+            with self.lock:
+                self.count += 1
+                number = self.count
+                self.conns[number] = conn
+                self.events.append({'conn': number, 'open': 1})
+            threading.Thread(target=self.read, args=(number, conn), daemon=True).start()
+
+    def read(self, number, conn):
+        decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        try:
+            while True:
+                data = conn.recv(4096)
+                if not data:
+                    break
+                with self.lock:
+                    self.events.append({'conn': number, 'data': decoder.decode(data)})
+        except OSError:
+            pass
+        with self.lock:
+            self.events.append({'conn': number, 'close': 1})
+            self.conns.pop(number, None)
+        conn.close()
+
+    def take(self):
+        with self.lock:
+            events, self.events = self.events, []
+        return events
+
+    def deliver(self, frame):
+        """The broker's lines to the providers, and the connections it dropped."""
+        for item in frame.get('to_providers', []):
+            with self.lock:
+                conn = self.conns.get(item['conn'])
+            if conn is None:
+                continue
+            try:
+                if 'line' in item:
+                    conn.sendall((item['line'] + '\n').encode('utf-8'))
+                if item.get('close'):
+                    conn.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
 
 def write_json(name, value):
@@ -319,6 +386,12 @@ def main():
             old.unlink(missing_ok=True)
     host = Host()
     host.step(0, 0, 0, 0, service=not args.console)
+    providers = None
+    if not args.console:
+        try:
+            providers = Providers()
+        except OSError as e:
+            print(f'providers: cannot listen on 127.0.0.1:{Providers.PORT} ({e}); is another preview running?', flush=True)
     player = Live(host, args.console) if args.console else Sample(host)
     log = []
 
@@ -357,7 +430,10 @@ def main():
                 if not args.console:
                     player.linked = linked
                 frame = host.step(int(q.get('held', 0)), int(q.get('pressed', 0)), int(q.get('circle', 0)), int(q.get('open', 0)),
-                                  player.take() if linked else [], linked, not args.console)
+                                  player.take() if linked else [], linked, not args.console,
+                                  providers.take() if providers else [])
+                if providers:
+                    providers.deliver(frame)
                 log.extend(frame['commands'])
                 for line in frame['librespot']:
                     player.command(line)
@@ -383,6 +459,9 @@ def main():
                     return self.file(REPO / 'src/ui/assets/chip.png')
                 if path.startswith('/sample/covers/'):
                     return self.file(COVERS / Path(path).name)
+                if path.startswith('/data/kabuki/art/'):  # a provider's pictures, kept under build/native-preview/art
+                    art = (OUT / 'art' / path[len('/data/kabuki/art/'):]).resolve()
+                    return self.file(art if (OUT / 'art').resolve() in art.parents else None)
                 if isinstance(player, Live):
                     try:
                         return self.file(player.cover(path))
