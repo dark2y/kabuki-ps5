@@ -38,7 +38,6 @@ const FingerprintSet supported_sets[] = {
         {0x6eeb30, 29, 0x1d9c912126922f03ULL},
         {0x69e334, 16, 0xb7ec89ce3a985c5eULL}
     }},
-    // Observed from SceShellUI SDK 0x13600007 (FW 13.60) in console-log.txt.
     {"13.60", {
         {0x6a4880, 40, 0xd15dc735f907ea34ULL},
         {0x6eeb30, 29, 0x1a394c083b0a9224ULL},
