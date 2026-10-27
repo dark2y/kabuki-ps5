@@ -20,6 +20,30 @@ struct FocusLease {
     std::uint64_t opening=0; // the opening the retakes count for
     unsigned retakes=0;
 };
+
+struct Fingerprint {
+    std::uint64_t offset;
+    std::size_t count;
+    std::uint64_t hash;
+};
+
+struct FingerprintSet {
+    Fingerprint checks[3];
+};
+
+const FingerprintSet supported_sets[] = {
+    {{ // FW 13.20
+        {0x6a4880, 40, 0x505f765f05540c68ULL},
+        {0x6eeb30, 29, 0x1d9c912126922f03ULL},
+        {0x69e334, 16, 0xb7ec89ce3a985c5eULL}
+    }},
+    {{ // FW 11.60
+        {0x6a4880, 40, 0xcb08ddaa43bc1f48ULL},
+        {0x6eeb30, 29, 0x1d9c912126922f03ULL},
+        {0x69e334, 16, 0xb7ec89ce3a985c5eULL}
+    }}
+};
+
 static std::uint64_t focus_fingerprint(const unsigned char* bytes,std::size_t count) {
     std::uint64_t h=0xcbf29ce484222325ULL;
     for(std::size_t i=0;i<count;++i) h=(h^bytes[i])*0x100000001b3ULL;
@@ -63,10 +87,22 @@ static bool prepare_focus(FocusLease& lease,const Ready& ready) {
     }
     lease.base=(std::uint64_t)kernel_dynlib_mapbase_addr(lease.core,handle);
     note("FOCUS Core module base=%llx",(unsigned long long)lease.base);
-    if(!user_address(lease.base)||
-       !focus_code(lease,0x6a4880,40,0x505f765f05540c68ULL)||
-       !focus_code(lease,0x6eeb30,29,0x1d9c912126922f03ULL)||
-       !focus_code(lease,0x69e334,16,0xb7ec89ce3a985c5eULL)) {
+    bool matched = false;
+    for (const auto& set : supported_sets) {
+        bool all_match = true;
+        for (const auto& f : set.checks) {
+            if (!focus_code(lease, f.offset, f.count, f.hash)) {
+                all_match = false;
+                break;
+            }
+        }
+        if (all_match) {
+            matched = true;
+            break;
+        }
+    }
+
+    if(!user_address(lease.base)|| !matched) {
         note("FOCUS unavailable: firmware fingerprints did not match; no ownership change"); return false;
     }
     if(mdbg_copyout(lease.core,(intptr_t)(lease.base+0x20d30f0),&lease.manager,sizeof lease.manager)||
