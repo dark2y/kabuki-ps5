@@ -228,7 +228,6 @@ private:
         if (!c.provider.empty() && c.hello) {
             for (const auto& t : c.tiles) tiles_.erase(t);
             s_.remove_provider(c.provider);
-            if (c.provider == "librespot") s_.set_system_note("Not running");
         }
         log("BROKER " + (c.provider.empty() ? "client " + std::to_string(id) : c.provider) + " dropped: " + why);
     }
@@ -335,7 +334,6 @@ private:
         };
         p.shown = [this, id](const std::string& tile) { send(id, {{"shown", {{"tile", tile}}}}); };
         s_.add_provider(name, p);
-        if (name == "librespot") s_.set_system_note("Connected");
 
         send(id, {{"welcome", {{"kabuki", version_}, {"versions", {1}}, {"art_dir", default_dir}, {"templates", {"media", "list", "plugin"}},
                                {"limits", {{"tiles", kBrokerTiles}, {"rows", kBrokerRows}, {"text", kBrokerText}, {"title", kBrokerTitle},
@@ -587,7 +585,6 @@ private:
         Issues issues;
         set_text(m, "note", c.note, issues, 60);
         report(id, issues, "");
-        if (c.provider == "librespot") s_.set_system_note(c.note.empty() ? "Connected" : c.note);
     }
 };
 

@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 extern "C" {
 int sceKernelGetCpuTemperature(int* temp);
+int sceKernelGetCurrentFanDuty(void* duty,void* chassis);
 int sceKernelGetSocSensorTemperature(int sensor,int* temp);
 int get_page_table_stats(int vm,int type,int* total,int* free);
 int sceKernelGetCpuUsage(void* threads,std::int32_t* count);
@@ -13,7 +14,7 @@ int sceKernelGetThreadName(std::uint32_t tid,char* name);
 }
 class SystemStats {
 public:
-    void tick(const State& s,std::uint32_t sdk,bool librespot) {
+    void tick(const State& s,std::uint32_t sdk) {
         const auto now=sceKernelGetProcessTime();
         if(!s.input_active||now<next) return;
         next=now+1000000;
@@ -22,10 +23,10 @@ public:
         timespec up{}; clock_gettime(CLOCK_MONOTONIC,&up);
         char text[768];
         std::snprintf(text,sizeof text,
-            "kabuki\t1\nstat\tcpu\t%.1f\nstat\tcpu_temp\t%d\nstat\tsoc_temp\t%d\nstat\tmem_used_gb\t%.2f\nstat\tmem_total_gb\t%.2f\n"
-            "stat\tfps\t%.1f\nstat\tfps_min\t%.1f\nstat\tuptime_s\t%lld\ninfo\tfirmware\t%s\ninfo\taddress\t%s\ninfo\tlibrespot\t%s\n",
-            cpu,cpu_temp,soc_temp,mem_used/1024.0,mem_total/1024.0,fps_average(),fps_lowest(),(long long)up.tv_sec,firmware,
-            address().c_str(),librespot?"Connected":"Not running");
+            "kabuki\t1\nstat\tcpu\t%.1f\nstat\tcpu_temp\t%d\nstat\tsoc_temp\t%d\nstat\tfan_duty\t%d\nstat\tmem_used_gb\t%.2f\nstat\tmem_total_gb\t%.2f\n"
+            "stat\tfps\t%.1f\nstat\tfps_min\t%.1f\nstat\tuptime_s\t%lld\ninfo\tfirmware\t%s\ninfo\taddress\t%s\n",
+            cpu,cpu_temp,soc_temp,fan_duty,mem_used/1024.0,mem_total/1024.0,fps_average(),fps_lowest(),(long long)up.tv_sec,firmware,
+            address().c_str());
         kabuki::write_file_atomic("/data/custom-overlays/system.rec",text);
         if(samples<=3) note("SYSTEM stats %.200s",text);
     }
@@ -41,7 +42,7 @@ private:
     std::uint64_t taken[2]={0,0};
     std::uint32_t idle_tid[16]{}; int idle_found=0;
     std::uint64_t next=0;
-    float cpu=-1; int cpu_temp=-1,soc_temp=-1,mem_used=-1,mem_total=-1;
+    float cpu=-1; int cpu_temp=-1,soc_temp=-1,fan_duty=-1,mem_used=-1,mem_total=-1;
     int dce=-1; std::uint64_t flips_at=0;
     std::uint64_t counters[12]{};int streak[12]{};float previous_rate[12]{};
     int selected_counter=-1;unsigned fps_failures=0;
@@ -54,6 +55,11 @@ private:
         step("temperature");
         cpu_temp=sceKernelGetCpuTemperature(&t)==0?t:-1;
         soc_temp=sceKernelGetSocSensorTemperature(0,&t)==0?t:-1;
+        alignas(16) unsigned char duty[256]{}, chassis[256]{};
+        std::uint16_t raw=0;
+        const int fan_rc=sceKernelGetCurrentFanDuty(duty,chassis);
+        std::memcpy(&raw,duty,sizeof raw);
+        fan_duty=fan_rc==0&&raw<=1024 ? int((unsigned(raw)*100+512)/1024) : -1;
         step("memory");
         memory();
         step("cpu");

@@ -23,11 +23,11 @@ constexpr int kSlots = kabuki::kSlots;
 // The System card's readings; a negative or empty value is shown as unavailable.
 struct SystemStats {
     float cpu=-1;                       // percent busy, all cores
-    float cpu_temp=-1,soc_temp=-1;      // degrees C
+    float cpu_temp=-1,soc_temp=-1,fan_duty=-1;      // degrees C
     float mem_used_gb=-1,mem_total_gb=-1;
     float fps=-1,fps_min=-1;            // frames a second: average and lowest over the last few seconds
     int uptime_s=-1;
-    std::string firmware,address,librespot;
+    std::string firmware,address;
 };
 constexpr int kHoldChoices[]={250,500,750,1000,1500,2000};
 inline std::string chord_name(std::uint32_t chord) {
@@ -311,12 +311,11 @@ public:
                     const auto& name=kabuki::field(r,1);
                     const float value=float(std::atof(kabuki::field(r,2).c_str()));
                     if(kabuki::field(r,0)=="stat") {
-                        if(name=="cpu") s.cpu=value; else if(name=="cpu_temp") s.cpu_temp=value; else if(name=="soc_temp") s.soc_temp=value;
+                        if(name=="cpu") s.cpu=value; else if(name=="cpu_temp") s.cpu_temp=value; else if(name=="soc_temp") s.soc_temp=value; else if(name=="fan_duty") s.fan_duty=value;
                         else if(name=="mem_used_gb") s.mem_used_gb=value; else if(name=="mem_total_gb") s.mem_total_gb=value;
                         else if(name=="fps") s.fps=value; else if(name=="fps_min") s.fps_min=value; else if(name=="uptime_s") s.uptime_s=int(value);
                     } else if(kabuki::field(r,0)=="info") {
                         if(name=="firmware") s.firmware=kabuki::field(r,2); else if(name=="address") s.address=kabuki::field(r,2);
-                        else if(name=="librespot") s.librespot=kabuki::field(r,2);
                     }
                 }
                 stats=s;
@@ -370,9 +369,8 @@ public:
             else if(pressed&0x40) { sound(n>1?sound::focus_move:sound::cursor_end); rail=shown_order[std::size_t((at+1)%n)]; }
             else if(pressed&0x4000) {
                 sound(sound::tab_enter);
-                tile=rail; focused=enterable(tile); suppress=held; repeat.reset(); // nothing to select: stay on the rail
-                enter_when_loaded=!focused&&loading_list(tile);
-                if(kind(tile)==kMedia) { control=2; seek=false; popup=0; } // always onto play/pause
+                tile=rail; focused=false; suppress=held; repeat.reset();
+                enter_when_loaded=false; // Opening from the icon rail must not steal focus, even after loading.
             } else if((pressed&0x80)&&enterable(tile)) {
                 focused=true; suppress=held; repeat.reset(); sound(sound::focus_move);
                 if(k==kMedia) { control=2; seek=false; popup=0; }

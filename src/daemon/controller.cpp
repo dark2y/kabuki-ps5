@@ -2,7 +2,6 @@
 #include "protocol.hpp"
 #include "broker.hpp"
 #include "plugin_file.hpp"
-#include "librespot_adapter.hpp"
 #include "legacy_focus.hpp"
 #include "prologue.hpp"
 #include "stable_shellui_injector.hpp"
@@ -162,45 +161,30 @@ static bool art_check(const std::string& dir,const std::string& path) {
     unsigned char head[4]{}; const bool read_ok=read(fd,head,sizeof head)==(ssize_t)sizeof head; close(fd);
     return !read_ok||(head[0]==0x89&&head[1]=='P'&&head[2]=='N'&&head[3]=='G')||(head[0]==0xFF&&head[1]==0xD8&&head[2]==0xFF);
 }
-// The panel's link to librespot-ps5 (its control.rs): a loopback socket kept here, outside
-// ShellUI. Each state line is left in player_file, which the worker reads as
-// /user/data/...; commands come from the worker's State ring, which is only ever read.
-// Kabuki's tiles (src/daemon/service.hpp) and, until librespot-ps5 registers its own, its link to
-// librespot-ps5's control channel on 127.0.0.1:38574 (src/daemon/librespot_adapter.hpp). Both
-// write the files the worker reads; the worker's commands come from its State ring.
+// Provider broker and panel command bridge; providers register their own tiles.
 class PlayerLink {
 public:
     PlayerLink() : service("/data/custom-overlays",monotonic_ms),
-                   adapter(service,[this](const std::string& line) { send_line(line); }),
                    broker(service,broker_hooks(),"/data/custom-overlays/art","0.2.0-rc.1") {
         service.load_settings();
-        service.set_system_note("Not running");
     }
     ~PlayerLink() {
-        disconnect(false);
         for(auto& peer:peers) close(peer.fd);
         if(listener>=0) close(listener);
     }
     void tick(const State& s) {
         const auto now=sceKernelGetProcessTime();
-        if(fd<0&&now>=next_attempt) connect_now(now);
-        if(fd>=0) receive();
         serve_providers(now);
         commands(s);
-        adapter.tick();
         broker.tick();
         flush_providers();
     }
-    bool linked() const { return fd>=0; }
 private:
-    static constexpr std::uint16_t port=38574;
     kabuki::Service service;
-    kabuki::LibrespotAdapter adapter;
-    int fd=-1; std::uint64_t next_attempt=0; std::string input;
-    bool seq_known=false; std::uint32_t seq=0; bool logged_absent=false;
+    bool seq_known=false; std::uint32_t seq=0;
 
     // The provider broker (src/daemon/broker.hpp, protocol/PROTOCOL.md): other programs' tiles
-    // over loopback. Kept here with the librespot link, ticked from the same loop.
+    // over loopback, ticked from the panel command loop.
     static constexpr std::uint16_t provider_port=38590;
     struct Peer { int id; int fd; std::string out; };
     kabuki::Broker broker;
@@ -214,7 +198,6 @@ private:
         };
         h.log=[](const std::string& text) { note("%.200s",text.c_str()); };
         h.art_ok=art_check;
-        h.native_provider=[this](const std::string& name){if(name=="librespot")adapter.native_takeover();};
         h.plugin_load=[](const std::string& path)->std::uintptr_t {
             struct stat st{};if(lstat(path.c_str(),&st)||!S_ISREG(st.st_mode))return 0;
             static std::map<std::string,std::uintptr_t> mapped;
@@ -300,54 +283,6 @@ private:
     static std::uint64_t monotonic_ms() {
         timespec t{}; clock_gettime(CLOCK_MONOTONIC,&t);
         return std::uint64_t(t.tv_sec)*1000+t.tv_nsec/1000000;
-    }
-    void connect_now(std::uint64_t now) {
-        next_attempt=now+2000000;
-        fd=socket(AF_INET,SOCK_STREAM,0); if(fd<0) return;
-        sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(port); a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
-        // Loopback connects or is refused at once.
-        if(connect(fd,reinterpret_cast<sockaddr*>(&a),sizeof a)) {
-            if(!logged_absent) { note("LINK librespot-ps5 not reachable on 127.0.0.1:%u errno=%d; retrying every 2 s",port,errno); logged_absent=true; }
-            close(fd); fd=-1; return;
-        }
-        fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)|O_NONBLOCK);
-        int yes=1; setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&yes,sizeof yes);
-        note("LINK connected to librespot-ps5"); logged_absent=false; input.clear();
-        adapter.connected();
-    }
-    void disconnect(bool tell) {
-        if(fd<0) return;
-        close(fd); fd=-1; input.clear();
-        if(tell) note("LINK librespot-ps5 disconnected");
-        adapter.disconnected();
-    }
-    void receive() {
-        char buffer[4096];
-        for(;;) {
-            const ssize_t n=recv(fd,buffer,sizeof buffer,0);
-            if(n>0) { input.append(buffer,(std::size_t)n); if(input.size()>262144) { disconnect(true); return; } continue; }
-            if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) break;
-            disconnect(true); return;
-        }
-        // Library and track lists each matter; of the state lines only the newest.
-        const auto end=input.rfind('\n'); if(end==std::string::npos) return;
-        std::string newest_state;
-        for(std::size_t from=0;from<=end;) {
-            const auto stop=input.find('\n',from);
-            std::string line=input.substr(from,stop-from);
-            from=stop+1;
-            if(line.empty()||line.front()!='{') continue;
-            if(!line.compare(0,10,"{\"library\"")||!line.compare(0,9,"{\"tracks\"")) adapter.line(line);
-            else newest_state=std::move(line);
-        }
-        input.erase(0,end+1);
-        if(!newest_state.empty()) adapter.line(newest_state);
-    }
-    void send_line(const std::string& line) {
-        if(fd<0) { note("LINK command dropped: librespot-ps5 not connected"); return; }
-        const std::string out=line+"\n";
-        if(send(fd,out.data(),out.size(),0)!=(ssize_t)out.size()) { disconnect(true); return; }
-        note("LINK sent %.120s",line.c_str());
     }
     void commands(const State& s) {
         if(!seq_known) { seq=s.command_seq; seq_known=true; return; } // Not earlier sessions' presses.
@@ -773,45 +708,26 @@ int main() {
     if(mkdir("/data/custom-overlays",0777)&&errno!=EEXIST) return 1;
     int lock=open("/data/custom-overlays/probe.lock",O_CREAT|O_RDWR,0666);
     if(lock<0) return 1;
-#ifdef PROBE_DEV_REPLACE
-    // DEVELOPMENT ONLY: a probe that is still running (an earlier build) used to make a new
-    // launch exit at once, leaving the old panel up (2026-10-15). Ask it to stop with its own
-    // stop file, wait for it to let go of the lock, then take over. A stop file left with no
-    // probe running is stale and would stop this one at once, so it goes too.
+    // A stale marker must not prevent a fresh launch. If another daemon owns the
+    // lock, request an orderly stop and wait for it to finish unhooking first.
     bool took_over=false,stale_stop=false;
-    int killed=0;
     if(flock(lock,LOCK_EX|LOCK_NB)) {
+        if(errno!=EWOULDBLOCK && errno!=EAGAIN) { close(lock); return 1; }
         const int fd=open("/data/custom-overlays/stop.txt",O_WRONLY|O_CREAT|O_EXCL,0666);
-        const bool ours=fd>=0;
-        if(fd>=0) { (void)!write(fd,"dev takeover\n",13); close(fd); }
-        const auto until=sceKernelGetProcessTime()+30000000,grace=sceKernelGetProcessTime()+8000000;
-        pid_t stuck=-1;
-        while(!(took_over=flock(lock,LOCK_EX|LOCK_NB)==0)&&sceKernelGetProcessTime()<until) {
-            // Still there after the grace period: its ShellUI cannot tick (a crashed one never
-            // removes the scene), so it never lets go. Its pid is in its log's last BEGIN line.
-            if(stuck<0&&sceKernelGetProcessTime()>=grace) {
-                stuck=0;
-                if(FILE* f=std::fopen("/data/custom-overlays/probe.log","rb")) {
-                    char line[512]; int pid=0;
-                    while(std::fgets(line,sizeof line,f))
-                        if(const char* at=std::strstr(line,"] BEGIN version=")) if(const char* p=std::strstr(at," pid=")) pid=std::atoi(p+5);
-                    std::fclose(f);
-                    if(pid>1&&pid!=getpid()&&kill(pid,SIGKILL)==0) stuck=pid;
-                }
-            }
+        if(fd>=0) { (void)!write(fd,"restart\n",8); close(fd); }
+        else if(errno!=EEXIST) { close(lock); return 1; }
+        const auto until=sceKernelGetProcessTime()+30000000;
+        while(!(took_over=flock(lock,LOCK_EX|LOCK_NB)==0)&&sceKernelGetProcessTime()<until)
             usleep(200000);
-        }
-        killed=stuck>0?stuck:0;
-        if(ours||took_over) unlink("/data/custom-overlays/stop.txt");
+        // Leave the request in place on timeout: another contender or the old
+        // worker may still need it. The next lock owner clears it safely.
         if(!took_over) { close(lock); return 1; }
-    } else stale_stop=unlink("/data/custom-overlays/stop.txt")==0;
-#else
-    if(flock(lock,LOCK_EX|LOCK_NB)) { close(lock); return 1; }
-#endif
+    }
+    // Holding the lock makes the marker stale, including one left by a crash.
+    if(unlink("/data/custom-overlays/stop.txt")==0) stale_stop=true;
+    else if(errno!=ENOENT) { close(lock); return 1; }
     output=std::fopen("/data/custom-overlays/probe.log","a"); if(!output) { close(lock); return 1; }
-#ifdef PROBE_DEV_REPLACE
-    if(took_over||stale_stop) note("DEV took_over_running_probe=%u killed_stuck_probe_pid=%d removed_stale_stop=%u",took_over,killed,stale_stop);
-#endif
+    if(took_over||stale_stop) note("restart took_over=%u cleared_stop=%u",took_over,stale_stop);
     std::signal(SIGINT,signal_stop); std::signal(SIGTERM,signal_stop);
     note("BEGIN version=%u variant=%s pid=%d duration_s=%u",
 #ifdef PROBE_PLAYER
@@ -987,7 +903,7 @@ int main() {
             link.tick(s);
 #endif
 #ifdef PROBE_NATIVE
-            system.tick(s,sdk,link.linked());
+            system.tick(s,sdk);
 #endif
 #ifdef PROBE_CAPTURE
             usleep(s.input_active?20000:100000);

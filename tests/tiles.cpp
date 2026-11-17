@@ -83,7 +83,11 @@ int main() {
     service.set_list("LSPLIB",library);now+=1000;model.poll_files(now);
     model.tick(++now,1,0,0,true);
     model.tick(++now,1,0,0x40,false);model.tick(++now,1,0,0x40,false);
-    model.tick(++now,1,0,0x4000,false);model.tick(++now,1,0,0x4000,false);
+    model.tick(++now,1,0,0x4000,false); // Open the icon without entering its card.
+    assert(model.view().tile=="LSPLIB"&&!model.view().focused);
+    model.tick(++now,1,0,0x80,false); // Right explicitly enters the card.
+    assert(model.view().focused);
+    model.tick(++now,1,0,0x4000,false);
     assert(model.view().tile=="LSPLIB"&&model.view().list.level==1&&model.view().list.loading);
     library.top.rows[0].title="Updated";service.set_list("LSPLIB",library);
     now+=1000;model.poll_files(now);assert(model.view().list.level==1&&model.view().list.loading);

@@ -45,7 +45,7 @@ constexpr float kPopupX = 12, kPopupY = 560, kPopupW = 496, kPopupH = 230;
 constexpr float kSliderX = 92, kSliderW = 380, kSliderY = 118;
 constexpr float kOptionTop = 22, kOptionH = 80, kSwitchW = 64, kSwitchH = 32;
 // System: rows of readings, then the console's details.
-constexpr float kStatH = 74, kInfoH = 44, kSysConsole = 104 + 18 + 4 * 74 + 40;
+constexpr float kStatH = 59, kInfoH = 40, kSysConsole = 104 + 18 + 6 * 59 + 30;
 // Settings rows, and the hold-time list (card coordinates) that opens under the second row.
 constexpr float kSideH = 80; // the sidebar page's slot rows
 constexpr float kSettingH = 84, kPickRowH = 56, kPickW = 300, kPickX = kCardW - 12 - kPickW;
@@ -220,7 +220,7 @@ template <class B> class Layout {
     W popup_, popup_face_, popup_title_, popup_value_, popup_hint_, vol_icon_, vol_base_, vol_fill_, vol_knob_;
     W opt_focus_, opt_icon_[2], opt_label_[2], opt_value_, sw_track_, sw_check_, sw_knob_;
     // System: readings in two sections.
-    static constexpr int kStatRows = 8;
+    static constexpr int kStatRows = 9;
     W sys_heading_[2], sys_label_[kStatRows], sys_value_[kStatRows], sys_base_[2], sys_fill_[2], sys_sub_;
     // Settings: three rows (shortcut, hold time, sounds), the hold-time list, the version.
     static constexpr int kSettingRows = 4, kChoices = 6;
@@ -381,14 +381,14 @@ public:
                 return false;
         }
         // System.
-        const char* stat_names[] = {"CPU", "Memory", "Frame rate", "Temperature", "Firmware", "Uptime", "IP address", "librespot-ps5"};
+        const char* stat_names[] = {"CPU", "Memory", "Frame rate", "CPU temperature", "SoC temperature", "Fan speed", "Firmware", "Uptime", "IP address"};
         for (int i = 0; i < 2; ++i)
             if (!b.label(sys_heading_[i], c, text_box(kPad, i ? kSysConsole : kListTop + 18, kContentW, kTimeSize), kTimeSize, bold, kSecondary,
                          left, ellipsis, i ? "Console" : "Performance"))
                 return false;
         for (int i = 0; i < kStatRows; ++i) {
-            const float base = stat_baseline(i), size = i < 4 ? 22 : 20;
-            if (!b.label(sys_label_[i], c, text_box(kPad, base, 240, size), size, normal, i < 4 ? kWhite : kSecondary, left, ellipsis, stat_names[i]) ||
+            const float base = stat_baseline(i), size = i < 6 ? 22 : 20;
+            if (!b.label(sys_label_[i], c, text_box(kPad, base, 240, size), size, normal, i < 6 ? kWhite : kSecondary, left, ellipsis, stat_names[i]) ||
                 !b.label(sys_value_[i], c, text_box(kCardW - kPad - 260, base, 260, size), size, light, kWhite, right, ellipsis, ""))
                 return false;
         }
@@ -897,7 +897,7 @@ private:
     }
 
     static float stat_baseline(int i) {
-        return i < 4 ? kListTop + 64 + i * kStatH : kSysConsole + 46 + (i - 4) * kInfoH;
+        return i < 6 ? kListTop + 64 + i * kStatH : kSysConsole + 40 + (i - 6) * kInfoH;
     }
 
     // System: the console's readings, unavailable ones as a dash.
@@ -920,17 +920,17 @@ private:
                 : number(st.mem_used_gb, "%.1f") + " / " + number(st.mem_total_gb, "%.1f GB"));
         b.words(sys_value_[2], number(st.fps, "%.0f fps"));
         b.words(sys_sub_, st.fps < 0 ? "" : "Average over 5 seconds, lowest " + number(st.fps_min, "%.0f"));
-        b.words(sys_value_[3], st.cpu_temp < 0 && st.soc_temp < 0 ? std::string("\xE2\x80\x94")
-                : "CPU " + number(st.cpu_temp, "%.0f\xC2\xB0" "C") + ", SoC " + number(st.soc_temp, "%.0f\xC2\xB0" "C"));
+        b.words(sys_value_[3], number(st.cpu_temp, "%.0f\xC2\xB0" "C"));
+        b.words(sys_value_[4], number(st.soc_temp, "%.0f\xC2\xB0" "C"));
+        b.words(sys_value_[5], number(st.fan_duty, "%.0f%%"));
         const float fill[] = {st.cpu < 0 ? 0 : std::min(st.cpu, 100.0f) / 100,
                               st.mem_total_gb > 0 && st.mem_used_gb >= 0 ? std::min(1.0f, st.mem_used_gb / st.mem_total_gb) : 0};
         for (int i = 0; i < 2; ++i) b.geometry(sys_fill_[i], {kPad, stat_baseline(i) + 16, std::max(0.1f, kContentW * fill[i]), 4});
         char uptime[32] = "\xE2\x80\x94";
         if (st.uptime_s >= 0) std::snprintf(uptime, sizeof uptime, "%d h %02d min", st.uptime_s / 3600, st.uptime_s / 60 % 60);
-        b.words(sys_value_[4], st.firmware.empty() ? "\xE2\x80\x94" : st.firmware);
-        b.words(sys_value_[5], uptime);
-        b.words(sys_value_[6], st.address.empty() ? "\xE2\x80\x94" : st.address);
-        b.words(sys_value_[7], st.librespot.empty() ? "\xE2\x80\x94" : st.librespot);
+        b.words(sys_value_[6], st.firmware.empty() ? "\xE2\x80\x94" : st.firmware);
+        b.words(sys_value_[7], uptime);
+        b.words(sys_value_[8], st.address.empty() ? "\xE2\x80\x94" : st.address);
     }
 
     // Placeholder rows while a list loads: tiles and bars of varied lengths, with a soft light
