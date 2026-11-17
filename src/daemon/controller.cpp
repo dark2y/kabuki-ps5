@@ -148,7 +148,9 @@ static bool stage_fonts() {
 // yet (or isn't written yet) passes; the worker copes with missing covers.
 static bool art_check(const std::string& dir,const std::string& path) {
     struct stat info{};
-    for(std::size_t at=dir.size();at<path.size();) {
+    // Validate the declared directory and its ancestors as well as the file.
+    (void)dir;
+    for(std::size_t at=0;at<path.size();) {
         const auto slash=path.find('/',at+1);
         if(lstat(path.substr(0,slash).c_str(),&info)) return errno==ENOENT;
         if(S_ISLNK(info.st_mode)) return false;
