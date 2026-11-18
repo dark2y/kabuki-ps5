@@ -48,7 +48,7 @@ inline int kind_of(Card c) {
 }
 
 struct TileView { std::string id,title,icon; int kind=kStats; bool online=false; };
-struct RowView { std::string title,subtitle,art; };
+struct RowView { std::string title,subtitle,art,key; };
 struct ListView {
     std::string title,art,heading;  // the header's title and art for this level; a heading over the rows
     bool covers=true,loading=false;
@@ -596,7 +596,7 @@ public:
             if(l) {
                 out.title=l->title; out.art=l->art; out.heading=l->heading; out.covers=l->covers; out.loading=l->loading;
                 out.empty=l->empty; out.empty_detail=l->empty_detail;
-                for(const auto& r:l->rows) out.rows.push_back({r.title,r.subtitle,r.art});
+                for(const auto& r:l->rows) out.rows.push_back({r.title,r.subtitle,r.art,r.key});
                 out.selected=self->selected_index(tile);
                 const auto* c=data(tile);
                 for(std::size_t i=0;c&&i<l->rows.size();++i) if(!c->l.busy.empty()&&l->rows[i].key==c->l.busy) out.busy=int(i);

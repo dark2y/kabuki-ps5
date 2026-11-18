@@ -229,7 +229,7 @@ template <class B> class Layout {
     W pick_, pick_face_, pick_focus_, pick_label_[kChoices], pick_tick_[kChoices], version_, version_low_, link_;
     W side_star_; // the first slot's tile opens with the panel
     W message_, message2_, list_heading_, list_, row_focus_, row_sweep_;
-    W row_tile_[kRows], row_cover_[kRows], row_title_[kRows], row_artist_[kRows];
+    W row_tile_[kRows], row_cover_[kRows], row_title_[kRows], row_artist_[kRows], row_more_icon_[kRows];
     // While a list loads: placeholder rows (a cover tile, title and artist bars) with a light that
     // sweeps across them row after row. No "Loading" text; the real rows fade in over them.
     W skel_, skel_tile_[kRows], skel_title_[kRows], skel_artist_[kRows], skel_sweep_[kRows];
@@ -340,6 +340,7 @@ public:
         for (int i = 0; i < kRows; ++i) {
             if (!b.skin(row_tile_[i], list_, {kPad, 0, kRowCover, kRowCover}, rounded, 4) ||
                 !b.image(row_cover_[i], list_, {kPad, 0, kRowCover, kRowCover}, "") ||
+                !b.image(row_more_icon_[i], list_, {0, 0, 28, 28}, b.icon("image_pulldown_arrow")) ||
                 !b.label(row_title_[i], list_, {0, 0, 10, 34}, 24, normal, kWhite, left, ellipsis, "") ||
                 !b.label(row_artist_[i], list_, {0, 0, 10, 30}, 20, light, kSecondary, left, ellipsis, ""))
                 return false;
@@ -419,8 +420,8 @@ public:
              // Kabuki's version: the bottom left of the screen while the panel is open.
              // With Settings showing, bottom left of the screen: Kabuki's version and where it comes from.
              b.image(side_more_, c, {kCardW - kPad - 28, kListTop + 3 * kSettingH + (kSettingH - 6) / 2 - 14, 28, 28}, b.icon("iconid_arrow_right")) &&
-             b.label(version_, b.screen(), text_box(48, 1080 - 66, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v0.2.0-rc.1") &&
-             b.label(version_low_, b.screen(), text_box(48, 1080 - 38, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v0.2.0-rc.1") &&
+             b.label(version_, b.screen(), text_box(48, 1080 - 66, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v1.0.0") &&
+             b.label(version_low_, b.screen(), text_box(48, 1080 - 38, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v1.0.0") &&
              b.image(side_star_, c, {0, 0, 22, 22}, b.icon("iconid_rating")) &&
              b.label(link_, b.screen(), text_box(48, 1080 - 38, 500, 20), 20, normal, kSecondary, left, ellipsis,
                      "github.com/stupiditytries") &&
@@ -490,7 +491,7 @@ public:
         for (auto& w : hint_) f(w);
         for (auto& w : rail_) f(w);
         for (auto& w : rail_label_) f(w);
-        for (int i = 0; i < kRows; ++i) { f(row_tile_[i]); f(row_cover_[i]); f(row_title_[i]); f(row_artist_[i]); }
+        for (int i = 0; i < kRows; ++i) { f(row_tile_[i]); f(row_cover_[i]); f(row_title_[i]); f(row_artist_[i]); f(row_more_icon_[i]); }
         f(skel_);
         for (int i = 0; i < kRows; ++i) { f(skel_tile_[i]); f(skel_title_[i]); f(skel_artist_[i]); f(skel_sweep_[i]); }
     }
@@ -959,7 +960,7 @@ private:
     }
 
     void lists(const NativeView& v, std::uint64_t now, float dt, bool playing) {
-        struct Row { std::string title, artist, cover; };
+        struct Row { std::string title, artist, cover, key; };
         std::vector<Row> rows;
         int selected = 0;
         bool covers = true;
@@ -968,7 +969,7 @@ private:
         if (v.tab == kList) {
             const auto& l = v.list;
             selected = l.selected; covers = l.covers; loading = l.loading;
-            for (const auto& r : l.rows) rows.push_back({r.title, r.subtitle, r.art});
+            for (const auto& r : l.rows) rows.push_back({r.title, r.subtitle, r.art, r.key});
             if (!loading && rows.empty()) { first = l.empty; second = l.empty_detail; }
             else if (!rows.empty()) heading = l.heading;
         }
@@ -1022,11 +1023,26 @@ private:
             used[i] = true;
             const auto& row = rows[index];
             const float y = (index - scroll_) * kRowH, tx = covers ? kPad + kRowCover + 18 : kPad, tw = kCardW - kPad - tx;
-            b.show(row_title_[i], true); b.show(row_artist_[i], true);
-            b.show(row_tile_[i], covers); b.show(row_cover_[i], covers);
+            // Plex's pagination sentinel is an action, not an ordinary track. Use its stable
+            // provider key rather than matching display text, so other lists stay unchanged.
+            const std::string prefix = "__plex_tracks_next_";
+            const bool more = v.tile == "PLXQUE" && row.key.compare(0, prefix.size(), prefix) == 0 &&
+                              row.key.size() > prefix.size() &&
+                              row.key.find_first_not_of("0123456789", prefix.size()) == std::string::npos;
+            b.show(row_title_[i], true); b.show(row_artist_[i], !more);
+            b.show(row_tile_[i], covers && !more); b.show(row_cover_[i], covers && !more);
+            b.show(row_more_icon_[i], more);
             // Title and artist as one block centred on the cover (y+14..y+74): the title's capitals
             // start level with its top, the artist's baseline sits just above its bottom.
-            b.geometry(row_title_[i], text_box(tx, y + kRowTitle, tw, 24)); b.words(row_title_[i], row.title);
+            b.words(row_title_[i], row.title);
+            if (more) {
+                constexpr float icon = 28, gap = 8;
+                const float width = std::min(b.text_width(row_title_[i], row.title), kContentW - icon - gap);
+                const float x = (kCardW - icon - gap - width) / 2;
+                b.geometry(row_more_icon_[i], {x, y + (kRowH - icon) / 2, icon, icon});
+                b.tint(row_more_icon_[i], kWhite, 1);
+                b.geometry(row_title_[i], text_box(x + icon + gap, y + kRowH / 2 + 9, width + 2, 24));
+            } else b.geometry(row_title_[i], text_box(tx, y + kRowTitle, tw, 24));
             b.geometry(row_artist_[i], text_box(tx, y + kRowArtist, tw, 20)); b.words(row_artist_[i], row.artist);
             const float cy = y + (kRowH - kRowCover) / 2;
             b.geometry(row_tile_[i], {kPad, cy, kRowCover, kRowCover});
@@ -1046,7 +1062,7 @@ private:
         for (int i = 0; i < kRows; ++i)
             if (!used[i]) {
                 b.show(row_title_[i], false); b.show(row_artist_[i], false);
-                b.show(row_tile_[i], false); b.show(row_cover_[i], false);
+                b.show(row_tile_[i], false); b.show(row_cover_[i], false); b.show(row_more_icon_[i], false);
                 if (!shown) b.picture(row_cover_[i], "");
             }
         b.show(row_sweep_, starting);

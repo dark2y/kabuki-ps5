@@ -167,7 +167,7 @@ static bool art_check(const std::string& dir,const std::string& path) {
 class PlayerLink {
 public:
     PlayerLink() : service("/data/custom-overlays",monotonic_ms),
-                   broker(service,broker_hooks(),"/data/custom-overlays/art","0.2.0-rc.1") {
+                   broker(service,broker_hooks(),"/data/custom-overlays/art","1.0.0") {
         service.load_settings();
     }
     ~PlayerLink() {

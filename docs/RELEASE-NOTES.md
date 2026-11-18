@@ -1,6 +1,6 @@
 Kabuki is a native control panel and homebrew overlay hub for PS5.
 
-This release candidate is available for console testing.
+Version 1.0.0 includes the Plex library pagination control and compact artwork support.
 
 - Configurable shortcut, sounds and sidebar arrangement.
 - Built-in System and Settings cards.
@@ -8,10 +8,9 @@ This release candidate is available for console testing.
 - Music controls, queue and library cards supplied by a compatible librespot-ps5 receiver.
 - Library navigation resets when the receiver changes account or session.
 
-**Tested on firmware 13.20.** Kabuki may work on firmware up to 13.60 and on other
-firmware versions, but those versions still need to be tested. There is no firmware
-version allowlist; runtime method and hook validation still applies. Please report
-your firmware version and results.
+**Firmware 13.60:** Kabuki and Plex playback have been used on the user's console;
+the new pagination control still requires on-console visual verification. There is no firmware
+version allowlist; runtime method and hook validation still applies.
 
 Copy `kabuki-ps5.elf` to a USB drive and load it manually. The default shortcut is
 L3 + R3 held for half a second. When using librespot-ps5, launch Kabuki first.
