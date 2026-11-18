@@ -11,7 +11,13 @@
 
 namespace common_fps::ps5 {
 
+struct ShellProcessIdentity { pid_t pid; long long started; };
+
+// For a tracee stopped by PT_ATTACH; unlike a live-process check, SSTOP is valid.
+[[nodiscard]] bool shellui_identity_matches_attached(ShellProcessIdentity target) noexcept;
+
 [[nodiscard]] std::uintptr_t map_shellui_plugin(pid_t pid,std::uint8_t* elf,std::uint64_t entry_offset,std::uint64_t symbol_offset) noexcept;
+[[nodiscard]] std::uintptr_t map_shellui_plugin(ShellProcessIdentity target,std::uint8_t* elf,std::uint64_t entry_offset,std::uint64_t symbol_offset) noexcept;
 
 enum class StableInjectionMode : std::uint8_t {
     StartRendererThread,
@@ -24,6 +30,13 @@ struct StableInjectionResult {
     bool auth_changed = false;
     bool auth_restored = false;
     bool attached = false;
+    bool identity_verified = false;
+    int preflight_status = -1;
+    std::size_t preflight_resolved = 0;
+    std::size_t preflight_unresolved = 0;
+    char preflight_first_unresolved[128]{};
+    bool preflight_pthread_create = false;
+    bool preflight_getpid = false;
     bool elf_loaded = false;
     bool payload_args_ready = false;
     bool remote_stager_ready = false;
@@ -54,6 +67,12 @@ struct StableInjectionResult {
     const std::uint8_t* renderer_elf,
     std::size_t renderer_size,
     StableInjectionMode mode =
+        StableInjectionMode::StartRendererThread) noexcept;
+
+// Verified variant: identity is checked after attach, before any remote work.
+[[nodiscard]] StableInjectionResult inject_shellui_stable(
+    ShellProcessIdentity target, const std::uint8_t* renderer_elf,
+    std::size_t renderer_size, StableInjectionMode mode =
         StableInjectionMode::StartRendererThread) noexcept;
 
 } // namespace common_fps::ps5

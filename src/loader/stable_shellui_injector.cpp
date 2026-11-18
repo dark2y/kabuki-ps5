@@ -10,10 +10,15 @@
 
 #include "stable_shellui_injector.hpp"
 #include "remote_call.hpp"
+#include "stable_elfldr_preflight.h"
 
 #include <csignal>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <sys/sysctl.h>
+#include <sys/user.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -100,10 +105,43 @@ std::uintptr_t resolve_remote(pid_t pid, const char* symbol) noexcept {
     return static_cast<std::uintptr_t>(pt_resolve(pid, nid));
 }
 
+// PT_ATTACH has stopped the tracee; SSTOP is expected here, unlike the
+// controller's live-process check. Fail closed on incomplete enumeration.
+bool identity_matches(ShellProcessIdentity target) noexcept {
+    if (target.pid <= 1 || target.started <= 0) return false;
+    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0};
+    std::size_t length = 0;
+    if (sysctl(mib, 4, nullptr, &length, nullptr, 0) || !length || length > 16*1024*1024) return false;
+    auto* bytes = static_cast<char*>(std::malloc(length));
+    if (!bytes) return false;
+    bool valid = sysctl(mib, 4, bytes, &length, nullptr, 0) == 0 && length != 0;
+    bool found = false;
+    for (std::size_t i = 0; valid && i < length;) {
+        if (length-i < sizeof(kinfo_proc)) { valid = false; break; }
+        const auto* p = reinterpret_cast<const kinfo_proc*>(bytes+i);
+        if (p->ki_structsize < static_cast<int>(sizeof(kinfo_proc)) ||
+            static_cast<std::size_t>(p->ki_structsize) > length-i) { valid = false; break; }
+        if (p->ki_pid == target.pid) {
+            const long long started = static_cast<long long>(p->ki_start.tv_sec)*1000000 + p->ki_start.tv_usec;
+            const bool named = std::strncmp(p->ki_comm, "SceShellUI", sizeof(p->ki_comm)) == 0 ||
+                               std::strncmp(p->ki_comm, "SceShellUI.elf", sizeof(p->ki_comm)) == 0;
+            if (found || !named || started != target.started || p->ki_stat == SZOMB || (p->ki_flag & P_WEXIT)) valid = false;
+            found = true;
+        }
+        i += static_cast<std::size_t>(p->ki_structsize);
+    }
+    std::free(bytes);
+    return valid && found;
+}
+
 } // namespace
 
-StableInjectionResult inject_shellui_stable(
-    pid_t shellui_pid,
+bool shellui_identity_matches_attached(ShellProcessIdentity target) noexcept {
+    return identity_matches(target);
+}
+
+static StableInjectionResult inject_impl(
+    pid_t shellui_pid, const ShellProcessIdentity* identity,
     const std::uint8_t* renderer_elf,
     std::size_t renderer_size,
     StableInjectionMode mode) noexcept {
@@ -127,6 +165,19 @@ StableInjectionResult inject_shellui_stable(
         result.attached = true;
 
         do {
+            if (identity && !identity_matches(*identity)) break;
+            result.identity_verified = identity != nullptr;
+            commonfps_preflight_result preflight{};
+            result.preflight_status = commonfps_stable_elfldr_preflight(
+                shellui_pid, renderer_elf, renderer_size, &preflight);
+            result.preflight_resolved = preflight.resolved;
+            result.preflight_unresolved = preflight.unresolved;
+            std::memcpy(result.preflight_first_unresolved, preflight.first_unresolved,
+                        sizeof(result.preflight_first_unresolved));
+            result.preflight_pthread_create = preflight.pthread_create_available != 0;
+            result.preflight_getpid = preflight.getpid_available != 0;
+            if (result.preflight_status != COMMONFPS_PREFLIGHT_OK ||
+                !result.preflight_pthread_create || !result.preflight_getpid) break;
             const std::uintptr_t pthread_create =
                 resolve_remote(shellui_pid, "pthread_create");
             if (pthread_create == 0)
@@ -244,7 +295,7 @@ StableInjectionResult inject_shellui_stable(
         } while (false);
 
         result.detached = pt_detach(shellui_pid, 0) == 0;
-        (void)kill(shellui_pid, SIGCONT);
+        if (!identity) (void)kill(shellui_pid, SIGCONT);
     }
 
     if (kernel_set_ucred_authid(self, original_auth) == 0) {
@@ -255,17 +306,33 @@ StableInjectionResult inject_shellui_stable(
     return result;
 }
 
-std::uintptr_t map_shellui_plugin(pid_t pid,std::uint8_t* elf,std::uint64_t entry_offset,std::uint64_t symbol_offset) noexcept {
+StableInjectionResult inject_shellui_stable(pid_t pid, const std::uint8_t* elf, std::size_t size, StableInjectionMode mode) noexcept {
+    return inject_impl(pid, nullptr, elf, size, mode);
+}
+StableInjectionResult inject_shellui_stable(ShellProcessIdentity target, const std::uint8_t* elf, std::size_t size, StableInjectionMode mode) noexcept {
+    return inject_impl(target.pid, &target, elf, size, mode);
+}
+
+static std::uintptr_t map_plugin_impl(pid_t pid,const ShellProcessIdentity* identity,std::uint8_t* elf,std::uint64_t entry_offset,std::uint64_t symbol_offset) noexcept {
     const auto self=getpid();const auto original=kernel_get_ucred_authid(self);
     if(!original||kernel_set_ucred_authid(self,kPtraceAuthId))return 0;
     std::uintptr_t address=0;
     if(pt_attach(pid)==0) {
-        const auto entry=commonfps_stable_elfldr_load(pid,elf);
-        if(entry>0)address=std::uintptr_t(entry)-entry_offset+symbol_offset;
+        const bool verified=!identity || identity_matches(*identity);
+        if (verified) {
+            const auto entry=commonfps_stable_elfldr_load(pid,elf);
+            if(entry>0)address=std::uintptr_t(entry)-entry_offset+symbol_offset;
+        }
         if(pt_detach(pid,0))address=0;
-        (void)kill(pid,SIGCONT);
+        if(!identity) (void)kill(pid,SIGCONT);
     }
     if(kernel_set_ucred_authid(self,original)||kernel_get_ucred_authid(self)!=original)return 0;
     return address;
+}
+std::uintptr_t map_shellui_plugin(pid_t pid,std::uint8_t* elf,std::uint64_t entry_offset,std::uint64_t symbol_offset) noexcept {
+    return map_plugin_impl(pid,nullptr,elf,entry_offset,symbol_offset);
+}
+std::uintptr_t map_shellui_plugin(ShellProcessIdentity target,std::uint8_t* elf,std::uint64_t entry_offset,std::uint64_t symbol_offset) noexcept {
+    return map_plugin_impl(target.pid,&target,elf,entry_offset,symbol_offset);
 }
 } // namespace common_fps::ps5
