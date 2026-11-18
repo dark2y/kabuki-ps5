@@ -239,6 +239,13 @@ struct FocusGuard {
                 (unsigned long long)s.pad_samples,(unsigned long long)s.toggles);
         }
     }
+    bool abandon() {
+        const bool relinquished=!lease.held;
+        if(lease.started&&!relinquished)
+            note("FOCUS cleanup unresolved: ShellUI identity changed; refusing to restore potentially stale ownership");
+        lease.started=false;
+        return relinquished;
+    }
     bool finish() {
         if(lease.started) {
             while(lease.held) {
@@ -249,7 +256,7 @@ struct FocusGuard {
             note("FOCUS SUMMARY acquired=%u restored=%u system_changes=%u errors=%u",
                 lease.acquired,lease.restored,lease.external,lease.errors);
         }
-        return !lease.errors;
+        return !lease.errors&&!lease.held;
     }
     ~FocusGuard() { (void)finish(); }
 };

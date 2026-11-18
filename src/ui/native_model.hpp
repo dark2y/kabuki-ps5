@@ -23,11 +23,11 @@ constexpr int kSlots = kabuki::kSlots;
 // The System card's readings; a negative or empty value is shown as unavailable.
 struct SystemStats {
     float cpu=-1;                       // percent busy, all cores
-    float cpu_temp=-1,soc_temp=-1;      // degrees C
+    float cpu_temp=-1,soc_temp=-1,fan_duty=-1;      // degrees C
     float mem_used_gb=-1,mem_total_gb=-1;
     float fps=-1,fps_min=-1;            // frames a second: average and lowest over the last few seconds
     int uptime_s=-1;
-    std::string firmware,address,librespot;
+    std::string firmware,address;
 };
 constexpr int kHoldChoices[]={250,500,750,1000,1500,2000};
 inline std::string chord_name(std::uint32_t chord) {
@@ -48,7 +48,7 @@ inline int kind_of(Card c) {
 }
 
 struct TileView { std::string id,title,icon; int kind=kStats; bool online=false; };
-struct RowView { std::string title,subtitle,art; };
+struct RowView { std::string title,subtitle,art,key; };
 struct ListView {
     std::string title,art,heading;  // the header's title and art for this level; a heading over the rows
     bool covers=true,loading=false;
@@ -311,12 +311,11 @@ public:
                     const auto& name=kabuki::field(r,1);
                     const float value=float(std::atof(kabuki::field(r,2).c_str()));
                     if(kabuki::field(r,0)=="stat") {
-                        if(name=="cpu") s.cpu=value; else if(name=="cpu_temp") s.cpu_temp=value; else if(name=="soc_temp") s.soc_temp=value;
+                        if(name=="cpu") s.cpu=value; else if(name=="cpu_temp") s.cpu_temp=value; else if(name=="soc_temp") s.soc_temp=value; else if(name=="fan_duty") s.fan_duty=value;
                         else if(name=="mem_used_gb") s.mem_used_gb=value; else if(name=="mem_total_gb") s.mem_total_gb=value;
                         else if(name=="fps") s.fps=value; else if(name=="fps_min") s.fps_min=value; else if(name=="uptime_s") s.uptime_s=int(value);
                     } else if(kabuki::field(r,0)=="info") {
                         if(name=="firmware") s.firmware=kabuki::field(r,2); else if(name=="address") s.address=kabuki::field(r,2);
-                        else if(name=="librespot") s.librespot=kabuki::field(r,2);
                     }
                 }
                 stats=s;
@@ -370,9 +369,8 @@ public:
             else if(pressed&0x40) { sound(n>1?sound::focus_move:sound::cursor_end); rail=shown_order[std::size_t((at+1)%n)]; }
             else if(pressed&0x4000) {
                 sound(sound::tab_enter);
-                tile=rail; focused=enterable(tile); suppress=held; repeat.reset(); // nothing to select: stay on the rail
-                enter_when_loaded=!focused&&loading_list(tile);
-                if(kind(tile)==kMedia) { control=2; seek=false; popup=0; } // always onto play/pause
+                tile=rail; focused=false; suppress=held; repeat.reset();
+                enter_when_loaded=false; // Opening from the icon rail must not steal focus, even after loading.
             } else if((pressed&0x80)&&enterable(tile)) {
                 focused=true; suppress=held; repeat.reset(); sound(sound::focus_move);
                 if(k==kMedia) { control=2; seek=false; popup=0; }
@@ -503,7 +501,7 @@ public:
             sound(next!=setting?sound::list_move:sound::cursor_end); setting=next;
         }
         if(pressed&0x4000) {
-            if(setting==0) { recording=true; recorded=0; suppress=held; sound(sound::popup_open); }
+            if(setting==0) { sound(sound::cursor_end); }
             else if(setting==1) {
                 choosing=true; choice=0; sound(sound::popup_open);
                 for(int i=0;i<int(sizeof kHoldChoices/sizeof kHoldChoices[0]);++i) if(kHoldChoices[i]==settings.hold_ms) choice=i;
@@ -598,7 +596,7 @@ public:
             if(l) {
                 out.title=l->title; out.art=l->art; out.heading=l->heading; out.covers=l->covers; out.loading=l->loading;
                 out.empty=l->empty; out.empty_detail=l->empty_detail;
-                for(const auto& r:l->rows) out.rows.push_back({r.title,r.subtitle,r.art});
+                for(const auto& r:l->rows) out.rows.push_back({r.title,r.subtitle,r.art,r.key});
                 out.selected=self->selected_index(tile);
                 const auto* c=data(tile);
                 for(std::size_t i=0;c&&i<l->rows.size();++i) if(!c->l.busy.empty()&&l->rows[i].key==c->l.busy) out.busy=int(i);

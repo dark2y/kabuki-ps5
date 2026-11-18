@@ -42,7 +42,7 @@ constexpr std::uint64_t magic=0x31454c47474f5448ULL;
 constexpr std::uint32_t protocol_version=6;
 #endif
 #ifdef PROBE_PLAYER
-// No practical time limits (one year): an opening lasts until Circle or L3+R3,
+// No practical time limits (one year): an opening lasts until Circle or touchpad touch,
 // and the session until `console.py HOST stop`. The guardian still releases
 // input when ShellUI's UI heartbeat goes stale or the pad disconnects.
 constexpr std::uint32_t session_seconds=365U*24*3600;
@@ -50,7 +50,7 @@ constexpr std::uint32_t session_seconds=365U*24*3600;
 constexpr std::uint32_t session_seconds=120;
 #endif
 #ifdef PROBE_PLAYER
-constexpr std::uint64_t chord_hold_us=500000; // L3+R3 held this long opens or closes
+constexpr std::uint64_t chord_hold_us=500000; // Touchpad contact held this long opens or closes
 #else
 constexpr std::uint64_t chord_hold_us=2000000;
 #endif

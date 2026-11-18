@@ -1,7 +1,13 @@
-/* Raw observation and bounded L3+R3 toggle. SPDX-License-Identifier: GPL-3.0-or-later */
+/* Raw observation and bounded touchpad-contact toggle. SPDX-License-Identifier: GPL-3.0-or-later */
 extern "C" int scePadGetDataInternal(int port,void* data);
+extern "C" int scePadInit();
+extern "C" int scePadGetHandle(int user,int type,int index);
+extern "C" int scePadOpen(int user,int type,int index,const void* params);
+extern "C" int scePadReadState(int handle,void* data);
+extern "C" int scePadClose(int handle);
+extern "C" int sceUserServiceGetForegroundUser(int* user);
 
-// A close asked for with Circle or L3+R3 hides the panel at once, but input is only given
+// A close asked for with Circle or touchpad contact hides the panel at once, but input is only given
 // back once those buttons are up: given back while still held, the game (or home) took the
 // held Circle as a press of its own.
 static std::uint32_t close_pending=NoRelease; // atomic: also set from the key hook
@@ -27,6 +33,39 @@ static std::uint32_t stick_directions(const unsigned char* raw) {
     held=axis(x,0x80,0x20,held)|axis(y,0x10,0x40,held);
     return held;
 }
+// The ShellUI-owned pad handle is distinct from the internal button observer.
+// Never close a borrowed handle or terminate ShellUI's UserService.
+static int touch_handle=-1, touch_user=-1;
+static bool touch_owned=false;
+static std::uint64_t touch_retry=0;
+static void touch_close() {
+    if(touch_owned && touch_handle>=0) scePadClose(touch_handle);
+    touch_handle=-1; touch_user=-1; touch_owned=false;
+}
+static bool touch_sample(std::uint64_t now) {
+    int user=-1;
+    if(sceUserServiceGetForegroundUser(&user)<0 || user<0) { touch_close(); return false; }
+    if(touch_handle>=0 && touch_user!=user) touch_close();
+    if(touch_handle<0) {
+        if(now<touch_retry) return false;
+        touch_retry=now+2000000;
+        if(scePadInit()<0) return false;
+        int h=scePadGetHandle(user,0,0); bool owned=false;
+        if(h<0) {h=scePadOpen(user,0,0,nullptr);owned=h>=0;}
+        if(h<0) return false;
+        touch_handle=h;touch_user=user;touch_owned=owned;
+        log("TOUCH handle ready owned=%d",int(owned));
+    }
+    alignas(32) unsigned char sample[256]{};
+    const int rc=scePadReadState(touch_handle,sample);
+    std::uint32_t buttons=0; std::uint64_t stamp=0;
+    std::memcpy(&buttons,sample,sizeof buttons); std::memcpy(&stamp,sample+0x50,sizeof stamp);
+    if(rc<0 || !sample[0x4c] || (buttons&0x80000000U) || !stamp || sample[0x34]>2) {
+        if(rc<0) {touch_close();touch_retry=now+2000000;}
+        return false;
+    }
+    return sample[0x34]!=0;
+}
 static void toggle_poll() {
     static std::uint64_t stamp[4]{},fresh[4]{},hold=0,last_poll=0,next_repeat=0;
     static std::uint64_t logged=0,pad_gone_at=0;
@@ -38,7 +77,7 @@ static void toggle_poll() {
     if(!__atomic_load_n(&state.input_active,__ATOMIC_ACQUIRE)) overlay_console::input(0,false);
 #endif
     if(__atomic_load_n(&state.phase,__ATOMIC_ACQUIRE)!=Running) {
-        hold=last_poll=next_repeat=0; previous=0; selected_port=-1; latched=true;
+        touch_close(); hold=last_poll=next_repeat=0; previous=0; selected_port=-1; latched=true;
         for(unsigned i=0;i<4;++i) stamp[i]=fresh[i]=0;
         return;
     }
@@ -49,14 +88,14 @@ static void toggle_poll() {
         release_input(GuardianLost); hold=0; latched=true; return;
     }
     if(__atomic_load_n(&state.stop,__ATOMIC_ACQUIRE)||access(worker_stop_path,F_OK)==0) {
-        release_input(StopRequest); return;
+        touch_close(); release_input(StopRequest); return;
     }
     if(__atomic_load_n(&state.input_active,__ATOMIC_ACQUIRE)&&
        now>=__atomic_load_n(&state.input_deadline,__ATOMIC_ACQUIRE)) release_input(Deadline);
     // Firmware 13.20: exported function takes a physical port index 0..3 and
     // writes 0x78 bytes. It returns buttons at 0, connected BYTE at 0x4c and
     // sample timestamp at 0x50. No PadOpen, focus setter or game handle is used.
-    int port=-1,rc=0; std::uint32_t buttons=0; unsigned char stick[6]{128,128,128,128,128,128};
+    int port=-1,rc=0; std::uint32_t buttons=0; bool touching=false; unsigned char stick[6]{128,128,128,128,128,128};
     for(int i=0;i<4;++i) {
         alignas(32) unsigned char raw[256]{};
         rc=scePadGetDataInternal(i,raw);
@@ -89,6 +128,7 @@ static void toggle_poll() {
             __atomic_load_n(&state.selection,__ATOMIC_RELAXED),__atomic_load_n(&state.enter_count,__ATOMIC_RELAXED));
     }
     if(port<0) { hold=0; previous=0; latched=true; return; }
+    touching=touch_sample(now);
 #ifdef PROBE_PLAYER
     if(!__atomic_load_n(&state.player_ready,__ATOMIC_ACQUIRE)||
        __atomic_load_n(&state.player_failed,__ATOMIC_ACQUIRE)) {
@@ -96,16 +136,12 @@ static void toggle_poll() {
     }
 #endif
 #ifdef PROBE_NATIVE
-    const std::uint32_t mask=overlay_console::chord_mask.load();
     const std::uint64_t hold_needed=overlay_console::chord_hold.load();
-    if(overlay_console::recording.load()) { hold=0; latched=true; } // a shortcut being recorded is not pressed
 #else
-    const std::uint32_t mask=6U; // L3=2, R3=4.
     const std::uint64_t hold_needed=chord_hold_us;
 #endif
-    const auto chord=buttons&mask;
-    if(!chord) { latched=false; hold=0; }
-    else if(chord!=mask) hold=0;
+    if(!touching) { latched=false; hold=0; }
+    else if(buttons&0x100000U) { hold=0; } // A click cancels the timer until released.
     else if(!latched) {
         if(!hold) hold=now;
         else if(now-hold>=hold_needed) {
@@ -121,7 +157,7 @@ static void toggle_poll() {
                 __atomic_store_n(&state.input_active,1,__ATOMIC_RELEASE);
             }
             const auto count=__atomic_add_fetch(&state.toggles,1,__ATOMIC_RELAXED);
-            log("TOGGLE chord hold_ms=%llu action=%s count=%llu",(unsigned long long)held_ms,
+            log("TOGGLE touchpad hold_ms=%llu action=%s count=%llu",(unsigned long long)held_ms,
                 closing()?"close":"open",(unsigned long long)count);
         }
     }
@@ -141,8 +177,8 @@ static void toggle_poll() {
 #endif
             request_close_on_release(BackButton);
         }
-        // Give input back once Circle, L3 and R3 are all up (at most 3 s after the close).
-        if(closing()&&(!(buttons&(0x2000U|mask))||now-__atomic_load_n(&close_asked_at,__ATOMIC_ACQUIRE)>3000000)) {
+        // Give input back once Circle and touch contact are released (at most 3 s).
+        if(closing()&&((!(buttons&0x2000U)&&!touching) || now-__atomic_load_n(&close_asked_at,__ATOMIC_ACQUIRE)>3000000)) {
             release_input(__atomic_load_n(&close_pending,__ATOMIC_ACQUIRE));
             __atomic_store_n(&close_pending,(std::uint32_t)NoRelease,__ATOMIC_RELEASE);
         }

@@ -2,10 +2,10 @@
 #include "protocol.hpp"
 #include "broker.hpp"
 #include "plugin_file.hpp"
-#include "librespot_adapter.hpp"
 #include "legacy_focus.hpp"
 #include "prologue.hpp"
 #include "stable_shellui_injector.hpp"
+#include "stable_elfldr_preflight.h"
 #include <cstdio>
 #include <cstdarg>
 #include <cstring>
@@ -99,6 +99,132 @@ static pid_t process_pid(const char* name,bool log=false) {
     std::free(bytes); return result;
 }
 static pid_t shell_pid() { return process_pid("SceShellUI",true); }
+
+// A PID alone is not a process identity. A failed or malformed enumeration, a
+// stopped/exiting process, and PID reuse are all unsafe, not proof of death.
+struct ShellIdentity { pid_t pid=-1; long long started=0; };
+enum class ShellStatus { Live, Absent, Unsafe };
+static ShellStatus shell_status(ShellIdentity& identity, bool establish=false) {
+    int mib[]={CTL_KERN,KERN_PROC,KERN_PROC_PROC,0}; std::size_t length=0;
+    if(sysctl(mib,4,nullptr,&length,nullptr,0)||!length||length>16*1024*1024) return ShellStatus::Unsafe;
+    auto* bytes=static_cast<char*>(std::malloc(length)); if(!bytes) return ShellStatus::Unsafe;
+    if(sysctl(mib,4,bytes,&length,nullptr,0)||!length) { std::free(bytes); return ShellStatus::Unsafe; }
+    ShellStatus result=ShellStatus::Absent; bool malformed=false; std::size_t i=0;
+    while(i<length) {
+        if(length-i<sizeof(kinfo_proc)) { malformed=true; break; }
+        const auto* p=reinterpret_cast<const kinfo_proc*>(bytes+i);
+        if(p->ki_structsize<(int)sizeof(kinfo_proc)||(std::size_t)p->ki_structsize>length-i) { malformed=true; break; }
+        if(p->ki_pid==identity.pid) {
+            const long long started=(long long)p->ki_start.tv_sec*1000000+p->ki_start.tv_usec;
+            const bool named=!std::strcmp(p->ki_comm,"SceShellUI")||!std::strcmp(p->ki_comm,"SceShellUI.elf");
+            if(result!=ShellStatus::Absent||!named||started<=0||p->ki_stat==SSTOP||p->ki_stat==SZOMB||(p->ki_flag&P_WEXIT)||(!establish&&started!=identity.started))
+                result=ShellStatus::Unsafe;
+            else { if(establish) identity.started=started; result=ShellStatus::Live; }
+        }
+        i+=(std::size_t)p->ki_structsize;
+    }
+    std::free(bytes); return malformed?ShellStatus::Unsafe:result;
+}
+static bool wait_for_preflight(ShellIdentity& target) {
+    const auto deadline=sceKernelGetProcessTime()+60000000;
+    do {
+        if(stopping()||shell_status(target)!=ShellStatus::Live) {
+            note("preflight stopped or ShellUI identity lost; aborting"); return false;
+        }
+        commonfps_preflight_result result{};
+        const int status=commonfps_stable_elfldr_preflight(target.pid,home_bridge_blob,home_bridge_blob_size,&result);
+        if(stopping()||shell_status(target)!=ShellStatus::Live) {
+            note("preflight stopped or ShellUI identity lost; aborting"); return false;
+        }
+        if(status!=COMMONFPS_PREFLIGHT_OK&&status!=COMMONFPS_PREFLIGHT_UNRESOLVED) {
+            note("preflight malformed or failed status=%d; aborting",status); return false;
+        }
+        note("preflight resolved=%zu missing=%zu first=%s pthread_create=%u getpid=%u",
+             result.resolved,result.unresolved,result.first_unresolved,
+             result.pthread_create_available,result.getpid_available);
+        if(sceKernelGetProcessTime()>=deadline) break;
+        if(status==COMMONFPS_PREFLIGHT_OK&&result.pthread_create_available&&result.getpid_available) return true;
+        usleep(100000);
+    } while(sceKernelGetProcessTime()<deadline);
+    note("preflight timed out; no injection attempted"); return false;
+}
+// Require a complete snapshot, the old PID absent altogether, and exactly one
+// usable replacement. A stopped/zombie candidate or reused PID is ambiguous.
+static ShellStatus replacement_snapshot(const ShellIdentity& old,ShellIdentity& replacement) {
+    int mib[]={CTL_KERN,KERN_PROC,KERN_PROC_PROC,0}; std::size_t length=0;
+    if(sysctl(mib,4,nullptr,&length,nullptr,0)||!length||length>16*1024*1024) return ShellStatus::Unsafe;
+    auto* bytes=static_cast<char*>(std::malloc(length)); if(!bytes) return ShellStatus::Unsafe;
+    if(sysctl(mib,4,bytes,&length,nullptr,0)||!length) { std::free(bytes); return ShellStatus::Unsafe; }
+    ShellStatus result=ShellStatus::Absent; std::size_t i=0;
+    while(i<length) {
+        if(length-i<sizeof(kinfo_proc)) { result=ShellStatus::Unsafe; break; }
+        const auto* p=reinterpret_cast<const kinfo_proc*>(bytes+i);
+        if(p->ki_structsize<(int)sizeof(kinfo_proc)||(std::size_t)p->ki_structsize>length-i) { result=ShellStatus::Unsafe; break; }
+        if(p->ki_pid==old.pid) { result=ShellStatus::Unsafe; break; }
+        if(!std::strcmp(p->ki_comm,"SceShellUI")||!std::strcmp(p->ki_comm,"SceShellUI.elf")) {
+            const long long started=(long long)p->ki_start.tv_sec*1000000+p->ki_start.tv_usec;
+            if(result!=ShellStatus::Absent||p->ki_pid<=1||started<=0||p->ki_stat==SSTOP||p->ki_stat==SZOMB||(p->ki_flag&P_WEXIT)) {
+                result=ShellStatus::Unsafe; break;
+            }
+            replacement={p->ki_pid,started}; result=ShellStatus::Live;
+        }
+        i+=(std::size_t)p->ki_structsize;
+    }
+    std::free(bytes); return result;
+}
+// A scheduling/monotonic-clock gap is only a possible suspend or wake, not
+// proof of either. The SDK exposes no validated PS5 power-state signal here.
+// Require continuous observations, never treating elapsed time alone as readiness.
+static bool recovery_clock(std::uint64_t& us) {
+    timespec t{};
+    if(clock_gettime(CLOCK_MONOTONIC,&t)||t.tv_sec<0||t.tv_nsec<0||t.tv_nsec>=1000000000) return false;
+    us=(std::uint64_t)t.tv_sec*1000000+(std::uint64_t)t.tv_nsec/1000;
+    return true;
+}
+static bool discover_replacement(const ShellIdentity& old,ShellIdentity& replacement) {
+    constexpr std::uint64_t window=30000000, budget=120000000, max_gap=2000000;
+    std::uint64_t begin=0,last=0,stable_since=0,now=0;
+    if(!recovery_clock(begin)) { note("recovery clock unavailable; refusing retry"); return false; }
+    last=begin;
+    ShellIdentity candidate{}; bool observing=false;
+    note("recovery observing replacement for 30s; clock gaps may indicate suspend, not confirmed wake");
+    while(!stopping()) {
+        if(!recovery_clock(now)||now<last||now<begin) {
+            note("recovery clock failed or moved backwards; refusing retry"); return false;
+        }
+        if(now-begin>=budget) break;
+        if(now-last>max_gap) {
+            note("recovery observation gap %llu ms; restarting stability window",(unsigned long long)((now-last)/1000));
+            observing=false;
+        }
+        last=now;
+        ShellIdentity current{};
+        const auto status=replacement_snapshot(old,current);
+        std::uint64_t sampled=0;
+        if(!recovery_clock(sampled)||sampled<now) {
+            note("recovery clock failed or moved backwards; refusing retry"); return false;
+        }
+        if(sampled-begin>=budget) break;
+        if(sampled-now>max_gap) {
+            note("recovery snapshot delayed; restarting stability window");
+            observing=false; last=sampled; usleep(250000); continue;
+        }
+        now=sampled; last=now;
+        if(status!=ShellStatus::Live) {
+            if(observing) note("recovery snapshot absent or unsafe; restarting stability window");
+            observing=false;
+        } else if(!observing||current.pid!=candidate.pid||current.started!=candidate.started) {
+            candidate=current; stable_since=now; observing=true;
+            note("recovery observing pid=%d start=%lld",candidate.pid,candidate.started);
+        } else if(now-stable_since>=window) {
+            replacement=candidate;
+            note("recovery stable observations complete pid=%d; power state not verified",candidate.pid);
+            return true;
+        }
+        usleep(250000);
+    }
+    note("ShellUI recovery observation stopped or timed out; no retry"); return false;
+}
 #ifdef PROBE_NATIVE
 #include "system-stats.inc"
 #include "chip-png.inc"
@@ -149,7 +275,9 @@ static bool stage_fonts() {
 // yet (or isn't written yet) passes; the worker copes with missing covers.
 static bool art_check(const std::string& dir,const std::string& path) {
     struct stat info{};
-    for(std::size_t at=dir.size();at<path.size();) {
+    // Validate the declared directory and its ancestors as well as the file.
+    (void)dir;
+    for(std::size_t at=0;at<path.size();) {
         const auto slash=path.find('/',at+1);
         if(lstat(path.substr(0,slash).c_str(),&info)) return errno==ENOENT;
         if(S_ISLNK(info.st_mode)) return false;
@@ -162,45 +290,32 @@ static bool art_check(const std::string& dir,const std::string& path) {
     unsigned char head[4]{}; const bool read_ok=read(fd,head,sizeof head)==(ssize_t)sizeof head; close(fd);
     return !read_ok||(head[0]==0x89&&head[1]=='P'&&head[2]=='N'&&head[3]=='G')||(head[0]==0xFF&&head[1]==0xD8&&head[2]==0xFF);
 }
-// The panel's link to librespot-ps5 (its control.rs): a loopback socket kept here, outside
-// ShellUI. Each state line is left in player_file, which the worker reads as
-// /user/data/...; commands come from the worker's State ring, which is only ever read.
-// Kabuki's tiles (src/daemon/service.hpp) and, until librespot-ps5 registers its own, its link to
-// librespot-ps5's control channel on 127.0.0.1:38574 (src/daemon/librespot_adapter.hpp). Both
-// write the files the worker reads; the worker's commands come from its State ring.
+// Provider broker and panel command bridge; providers register their own tiles.
 class PlayerLink {
 public:
-    PlayerLink() : service("/data/custom-overlays",monotonic_ms),
-                   adapter(service,[this](const std::string& line) { send_line(line); }),
-                   broker(service,broker_hooks(),"/data/custom-overlays/art","0.2.0-rc.1") {
+    explicit PlayerLink(ShellIdentity target_identity) : target(target_identity), service("/data/custom-overlays",monotonic_ms),
+                   broker(service,broker_hooks(),"/data/custom-overlays/art","1.2.0") {
         service.load_settings();
-        service.set_system_note("Not running");
     }
     ~PlayerLink() {
-        disconnect(false);
         for(auto& peer:peers) close(peer.fd);
         if(listener>=0) close(listener);
     }
     void tick(const State& s) {
         const auto now=sceKernelGetProcessTime();
-        if(fd<0&&now>=next_attempt) connect_now(now);
-        if(fd>=0) receive();
         serve_providers(now);
         commands(s);
-        adapter.tick();
         broker.tick();
         flush_providers();
     }
-    bool linked() const { return fd>=0; }
 private:
-    static constexpr std::uint16_t port=38574;
+    ShellIdentity target;
+    std::map<std::string,std::uintptr_t> mapped;
     kabuki::Service service;
-    kabuki::LibrespotAdapter adapter;
-    int fd=-1; std::uint64_t next_attempt=0; std::string input;
-    bool seq_known=false; std::uint32_t seq=0; bool logged_absent=false;
+    bool seq_known=false; std::uint32_t seq=0;
 
     // The provider broker (src/daemon/broker.hpp, protocol/PROTOCOL.md): other programs' tiles
-    // over loopback. Kept here with the librespot link, ticked from the same loop.
+    // over loopback, ticked from the panel command loop.
     static constexpr std::uint16_t provider_port=38590;
     struct Peer { int id; int fd; std::string out; };
     kabuki::Broker broker;
@@ -214,28 +329,18 @@ private:
         };
         h.log=[](const std::string& text) { note("%.200s",text.c_str()); };
         h.art_ok=art_check;
-        h.native_provider=[this](const std::string& name){if(name=="librespot")adapter.native_takeover();};
-        h.plugin_load=[](const std::string& path)->std::uintptr_t {
+        h.plugin_load=[this](const std::string& path)->std::uintptr_t {
+            if(shell_status(target)!=ShellStatus::Live) return 0;
             struct stat st{};if(lstat(path.c_str(),&st)||!S_ISREG(st.st_mode))return 0;
-            static std::map<std::string,std::uintptr_t> mapped;
             const auto key=path+":"+std::to_string(st.st_size)+":"+std::to_string(st.st_mtime);
             if(auto it=mapped.find(key);it!=mapped.end())return it->second;
             if(mapped.size()>=16)return 0;
             std::vector<std::uint8_t> bytes;std::uint64_t symbol=0;
             if(!kabuki::plugin_file(path,bytes,symbol))return 0;
-            int mib[]={CTL_KERN,KERN_PROC,KERN_PROC_PROC,0};std::size_t length=0;
-            if(sysctl(mib,4,nullptr,&length,nullptr,0)||!length)return 0;
-            std::vector<unsigned char> processes(length);
-            if(sysctl(mib,4,processes.data(),&length,nullptr,0))return 0;
-            pid_t target=-1;
-            for(std::size_t at=0;at+sizeof(kinfo_proc)<=length;) {
-                const auto* p=reinterpret_cast<const kinfo_proc*>(processes.data()+at);
-                if(!std::strcmp(p->ki_comm,"SceShellUI")){target=p->ki_pid;break;}
-                if(p->ki_structsize<0||std::size_t(p->ki_structsize)<sizeof(kinfo_proc)||std::size_t(p->ki_structsize)>length-at)break;at+=p->ki_structsize;
-            }
-            if(target<0)return 0;
+            if(shell_status(target)!=ShellStatus::Live)return 0;
             const auto entry=reinterpret_cast<const Elf64_Ehdr*>(bytes.data())->e_entry;
-            const auto address=common_fps::ps5::map_shellui_plugin(target,bytes.data(),entry,symbol);
+            const auto address=common_fps::ps5::map_shellui_plugin(common_fps::ps5::ShellProcessIdentity{target.pid,target.started},bytes.data(),entry,symbol);
+            if(shell_status(target)!=ShellStatus::Live)return 0;
             if(address)mapped[key]=address;
             note("PLUGIN mapped=%u size=%zu",address!=0,bytes.size());return address;
         };
@@ -300,54 +405,6 @@ private:
     static std::uint64_t monotonic_ms() {
         timespec t{}; clock_gettime(CLOCK_MONOTONIC,&t);
         return std::uint64_t(t.tv_sec)*1000+t.tv_nsec/1000000;
-    }
-    void connect_now(std::uint64_t now) {
-        next_attempt=now+2000000;
-        fd=socket(AF_INET,SOCK_STREAM,0); if(fd<0) return;
-        sockaddr_in a{}; a.sin_family=AF_INET; a.sin_port=htons(port); a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
-        // Loopback connects or is refused at once.
-        if(connect(fd,reinterpret_cast<sockaddr*>(&a),sizeof a)) {
-            if(!logged_absent) { note("LINK librespot-ps5 not reachable on 127.0.0.1:%u errno=%d; retrying every 2 s",port,errno); logged_absent=true; }
-            close(fd); fd=-1; return;
-        }
-        fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)|O_NONBLOCK);
-        int yes=1; setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&yes,sizeof yes);
-        note("LINK connected to librespot-ps5"); logged_absent=false; input.clear();
-        adapter.connected();
-    }
-    void disconnect(bool tell) {
-        if(fd<0) return;
-        close(fd); fd=-1; input.clear();
-        if(tell) note("LINK librespot-ps5 disconnected");
-        adapter.disconnected();
-    }
-    void receive() {
-        char buffer[4096];
-        for(;;) {
-            const ssize_t n=recv(fd,buffer,sizeof buffer,0);
-            if(n>0) { input.append(buffer,(std::size_t)n); if(input.size()>262144) { disconnect(true); return; } continue; }
-            if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK)) break;
-            disconnect(true); return;
-        }
-        // Library and track lists each matter; of the state lines only the newest.
-        const auto end=input.rfind('\n'); if(end==std::string::npos) return;
-        std::string newest_state;
-        for(std::size_t from=0;from<=end;) {
-            const auto stop=input.find('\n',from);
-            std::string line=input.substr(from,stop-from);
-            from=stop+1;
-            if(line.empty()||line.front()!='{') continue;
-            if(!line.compare(0,10,"{\"library\"")||!line.compare(0,9,"{\"tracks\"")) adapter.line(line);
-            else newest_state=std::move(line);
-        }
-        input.erase(0,end+1);
-        if(!newest_state.empty()) adapter.line(newest_state);
-    }
-    void send_line(const std::string& line) {
-        if(fd<0) { note("LINK command dropped: librespot-ps5 not connected"); return; }
-        const std::string out=line+"\n";
-        if(send(fd,out.data(),out.size(),0)!=(ssize_t)out.size()) { disconnect(true); return; }
-        note("LINK sent %.120s",line.c_str());
     }
     void commands(const State& s) {
         if(!seq_known) { seq=s.command_seq; seq_known=true; return; } // Not earlier sessions' presses.
@@ -616,82 +673,87 @@ static bool patch_input(const Ready& r,InputPatch& p,bool install) {
     } else { p.restored=ok; if(ok) p.installed=false; }
     note("input hook install=%u verified=%u",install,ok); return ok;
 }
-static bool transaction(const Ready& r,const unsigned char* expected,const unsigned char* desired,
+static bool transaction(const ShellIdentity& target,const Ready& r,const unsigned char* expected,const unsigned char* desired,
                         const unsigned char* trampoline,std::size_t length,bool arm,InputPatch* input=nullptr) {
-    const pid_t pid=r.state.pid,self=getpid(); const auto auth=kernel_get_ucred_authid(self);
+    const pid_t pid=target.pid,self=getpid();
+    if(pid!=r.state.pid) return false;
+    const auto auth=kernel_get_ucred_authid(self);
     if(!auth||kernel_set_ucred_authid(self,0x4800000000010003ULL)) return false;
     bool attached=pt_attach(pid)==0,ok=false;
     if(attached) {
-        bool input_ok=!input||arm||patch_input(r,*input,false);
-        unsigned char current[16];
-        if(mdbg_copyout(pid,(intptr_t)r.state.update,current,16)==0&&std::memcmp(current,expected,16)==0) {
-            bool prepared=true;
-            if(arm) {
-                prepared=migrate_focus_property(r);
-                if(prepared) prepared=migrate_inherited_lookup(r);
-                if(prepared) prepared=write_code(pid,r.state.trampoline,trampoline,length+14);
-                if(prepared&&input) prepared=write_code(pid,input->trampoline_address,input->trampoline,input->length+14);
-                note("prepare trampoline verified=%u",prepared);
-                State s;
-                if(prepared) {
-                    prepared=read_state(r,s);
-                    note("prepare state read=%u",prepared);
-                }
-                if(prepared) {
-                    s.original=r.state.trampoline; s.phase=Armed; s.stop=0; s.seconds=session_seconds;
-                    s.removed=0; s.started=0; s.frames=0;
-#ifdef PROBE_INPUT
-                    s.key_original=r.state.key_trampoline;
-                    s.input_started=s.input_deadline=s.input_released=0;
-                    s.input_active=0; s.release_reason=NoRelease;
-                    s.events_seen=s.events_consumed=0;
-                    s.last_key=s.last_type=s.last_device=s.selection=s.enter_count=0;
-#ifdef PROBE_TOGGLE
-                    s.pad_samples=s.toggles=s.ui_heartbeat=0;
-                    s.pad_buttons=s.pad_port=s.pad_connected=0; s.pad_rc=0;
-#ifdef PROBE_PLAYER
-                    s.surface_frames=s.surface_uploads=s.render_max_us=s.upload_max_us=0;
-#endif
-#endif
-#endif
-                    int rc=mdbg_copyin(pid,&s,(intptr_t)r.address,sizeof s);
-                    note("prepare state write mdbg_rc=%d errno=%d",rc,errno);
-                    if(rc) {
-                        rc=pt_copyin(pid,&s,(intptr_t)r.address,sizeof s);
-                        note("prepare state write ptrace_rc=%d errno=%d",rc,errno);
+        const bool verified=common_fps::ps5::shellui_identity_matches_attached({target.pid,target.started});
+        if(verified) {
+            bool input_ok=!input||arm||patch_input(r,*input,false);
+            unsigned char current[16];
+            if(mdbg_copyout(pid,(intptr_t)r.state.update,current,16)==0&&std::memcmp(current,expected,16)==0) {
+                bool prepared=true;
+                if(arm) {
+                    prepared=migrate_focus_property(r);
+                    if(prepared) prepared=migrate_inherited_lookup(r);
+                    if(prepared) prepared=write_code(pid,r.state.trampoline,trampoline,length+14);
+                    if(prepared&&input) prepared=write_code(pid,input->trampoline_address,input->trampoline,input->length+14);
+                    note("prepare trampoline verified=%u",prepared);
+                    State s;
+                    if(prepared) {
+                        prepared=read_state(r,s);
+                        note("prepare state read=%u",prepared);
                     }
-                    State check;
-                    prepared=rc==0&&read_state(r,check)&&std::memcmp(&check,&s,sizeof s)==0;
-                    note("prepare state verified=%u",prepared);
+                    if(prepared) {
+                        s.original=r.state.trampoline; s.phase=Armed; s.stop=0; s.seconds=session_seconds;
+                        s.removed=0; s.started=0; s.frames=0;
+    #ifdef PROBE_INPUT
+                        s.key_original=r.state.key_trampoline;
+                        s.input_started=s.input_deadline=s.input_released=0;
+                        s.input_active=0; s.release_reason=NoRelease;
+                        s.events_seen=s.events_consumed=0;
+                        s.last_key=s.last_type=s.last_device=s.selection=s.enter_count=0;
+    #ifdef PROBE_TOGGLE
+                        s.pad_samples=s.toggles=s.ui_heartbeat=0;
+                        s.pad_buttons=s.pad_port=s.pad_connected=0; s.pad_rc=0;
+    #ifdef PROBE_PLAYER
+                        s.surface_frames=s.surface_uploads=s.render_max_us=s.upload_max_us=0;
+    #endif
+    #endif
+    #endif
+                        int rc=mdbg_copyin(pid,&s,(intptr_t)r.address,sizeof s);
+                        note("prepare state write mdbg_rc=%d errno=%d",rc,errno);
+                        if(rc) {
+                            rc=pt_copyin(pid,&s,(intptr_t)r.address,sizeof s);
+                            note("prepare state write ptrace_rc=%d errno=%d",rc,errno);
+                        }
+                        State check;
+                        prepared=rc==0&&read_state(r,check)&&std::memcmp(&check,&s,sizeof s)==0;
+                        note("prepare state verified=%u",prepared);
+                    }
                 }
-            }
-            if(prepared&&arm&&input) prepared=patch_input(r,*input,true);
-            if(prepared) {
-                ok=write_code(pid,r.state.update,desired,16);
-                if(!ok) {
-                    bool rollback=write_code(pid,r.state.update,expected,16);
-                    note("patch failed rollback_verified=%u",rollback);
-                    if(arm&&rollback) {
-                        State s;
-                        if(read_state(r,s)) {
-                            s.phase=Prepared; s.original=0; s.removed=1;
-                            (void)pt_copyin(pid,&s,(intptr_t)r.address,sizeof s);
+                if(prepared&&arm&&input) prepared=patch_input(r,*input,true);
+                if(prepared) {
+                    ok=write_code(pid,r.state.update,desired,16);
+                    if(!ok) {
+                        bool rollback=write_code(pid,r.state.update,expected,16);
+                        note("patch failed rollback_verified=%u",rollback);
+                        if(arm&&rollback) {
+                            State s;
+                            if(read_state(r,s)) {
+                                s.phase=Prepared; s.original=0; s.removed=1;
+                                (void)pt_copyin(pid,&s,(intptr_t)r.address,sizeof s);
+                            }
                         }
                     }
                 }
+            } else note("patch refused: target bytes changed");
+            if(arm&&!ok&&input) input_ok=patch_input(r,*input,false);
+            if(arm&&!ok&&input_ok) {
+                unsigned char check[16]; State s;
+                if(!mdbg_copyout(pid,(intptr_t)r.state.update,check,sizeof check)&&
+                   !std::memcmp(check,expected,sizeof check)&&read_state(r,s)) {
+                    s.phase=Prepared; s.removed=1; s.original=0;
+                    (void)pt_copyin(pid,&s,(intptr_t)r.address,sizeof s);
+                }
             }
-        } else note("patch refused: target bytes changed");
-        if(arm&&!ok&&input) input_ok=patch_input(r,*input,false);
-        if(arm&&!ok&&input_ok) {
-            unsigned char check[16]; State s;
-            if(!mdbg_copyout(pid,(intptr_t)r.state.update,check,sizeof check)&&
-               !std::memcmp(check,expected,sizeof check)&&read_state(r,s)) {
-                s.phase=Prepared; s.removed=1; s.original=0;
-                (void)pt_copyin(pid,&s,(intptr_t)r.address,sizeof s);
-            }
-        }
-        ok=ok&&input_ok;
-        bool detached=pt_detach(pid,0)==0; (void)kill(pid,SIGCONT);
+            ok=ok&&input_ok;
+        } else note("transaction refused: attached ShellUI identity mismatch");
+        const bool detached=pt_detach(pid,0)==0;
         note("transaction arm=%u patched=%u detached=%u",arm,ok,detached); ok=ok&&detached;
     }
     bool restored=kernel_set_ucred_authid(self,auth)==0&&kernel_get_ucred_authid(self)==auth;
@@ -773,45 +835,26 @@ int main() {
     if(mkdir("/data/custom-overlays",0777)&&errno!=EEXIST) return 1;
     int lock=open("/data/custom-overlays/probe.lock",O_CREAT|O_RDWR,0666);
     if(lock<0) return 1;
-#ifdef PROBE_DEV_REPLACE
-    // DEVELOPMENT ONLY: a probe that is still running (an earlier build) used to make a new
-    // launch exit at once, leaving the old panel up (2026-10-15). Ask it to stop with its own
-    // stop file, wait for it to let go of the lock, then take over. A stop file left with no
-    // probe running is stale and would stop this one at once, so it goes too.
+    // A stale marker must not prevent a fresh launch. If another daemon owns the
+    // lock, request an orderly stop and wait for it to finish unhooking first.
     bool took_over=false,stale_stop=false;
-    int killed=0;
     if(flock(lock,LOCK_EX|LOCK_NB)) {
+        if(errno!=EWOULDBLOCK && errno!=EAGAIN) { close(lock); return 1; }
         const int fd=open("/data/custom-overlays/stop.txt",O_WRONLY|O_CREAT|O_EXCL,0666);
-        const bool ours=fd>=0;
-        if(fd>=0) { (void)!write(fd,"dev takeover\n",13); close(fd); }
-        const auto until=sceKernelGetProcessTime()+30000000,grace=sceKernelGetProcessTime()+8000000;
-        pid_t stuck=-1;
-        while(!(took_over=flock(lock,LOCK_EX|LOCK_NB)==0)&&sceKernelGetProcessTime()<until) {
-            // Still there after the grace period: its ShellUI cannot tick (a crashed one never
-            // removes the scene), so it never lets go. Its pid is in its log's last BEGIN line.
-            if(stuck<0&&sceKernelGetProcessTime()>=grace) {
-                stuck=0;
-                if(FILE* f=std::fopen("/data/custom-overlays/probe.log","rb")) {
-                    char line[512]; int pid=0;
-                    while(std::fgets(line,sizeof line,f))
-                        if(const char* at=std::strstr(line,"] BEGIN version=")) if(const char* p=std::strstr(at," pid=")) pid=std::atoi(p+5);
-                    std::fclose(f);
-                    if(pid>1&&pid!=getpid()&&kill(pid,SIGKILL)==0) stuck=pid;
-                }
-            }
+        if(fd>=0) { (void)!write(fd,"restart\n",8); close(fd); }
+        else if(errno!=EEXIST) { close(lock); return 1; }
+        const auto until=sceKernelGetProcessTime()+30000000;
+        while(!(took_over=flock(lock,LOCK_EX|LOCK_NB)==0)&&sceKernelGetProcessTime()<until)
             usleep(200000);
-        }
-        killed=stuck>0?stuck:0;
-        if(ours||took_over) unlink("/data/custom-overlays/stop.txt");
+        // Leave the request in place on timeout: another contender or the old
+        // worker may still need it. The next lock owner clears it safely.
         if(!took_over) { close(lock); return 1; }
-    } else stale_stop=unlink("/data/custom-overlays/stop.txt")==0;
-#else
-    if(flock(lock,LOCK_EX|LOCK_NB)) { close(lock); return 1; }
-#endif
+    }
+    // Holding the lock makes the marker stale, including one left by a crash.
+    if(unlink("/data/custom-overlays/stop.txt")==0) stale_stop=true;
+    else if(errno!=ENOENT) { close(lock); return 1; }
     output=std::fopen("/data/custom-overlays/probe.log","a"); if(!output) { close(lock); return 1; }
-#ifdef PROBE_DEV_REPLACE
-    if(took_over||stale_stop) note("DEV took_over_running_probe=%u killed_stuck_probe_pid=%d removed_stale_stop=%u",took_over,killed,stale_stop);
-#endif
+    if(took_over||stale_stop) note("restart took_over=%u cleared_stop=%u",took_over,stale_stop);
     std::signal(SIGINT,signal_stop); std::signal(SIGTERM,signal_stop);
     note("BEGIN version=%u variant=%s pid=%d duration_s=%u",
 #ifdef PROBE_PLAYER
@@ -834,7 +877,7 @@ int main() {
 #ifdef PROBE_INPUT
 #ifdef PROBE_TOGGLE
 #ifdef PROBE_CAPTURE
-    note("toggle L3+R3 hold_ms=%llu limit_ms=%llu session_s=%u game_focus_lease=1 guardian=native_parent clocks=relative",
+    note("toggle touchpad touch hold_ms=%llu limit_ms=%llu session_s=%u game_focus_lease=1 guardian=native_parent clocks=relative",
          (unsigned long long)(chord_hold_us/1000),(unsigned long long)(input_limit_us/1000),session_seconds);
 #else
     note("toggle L3+R3 hold_ms=2000 limit_ms=10000 session_s=120 raw_observe=1 game_exclusive=0");
@@ -847,6 +890,7 @@ int main() {
     note("DEV replace mode ON build=%016llx; development only",(unsigned long long)PROBE_BUILD_ID);
 #endif
     int failed=1;
+    ShellIdentity previous{}, next{}; bool reattaching=false;
     do {
         std::uint32_t sdk=0; std::size_t len=sizeof sdk;
         // Firmware is diagnostic only. Resolve and validate the live methods and
@@ -854,8 +898,16 @@ int main() {
         if(sysctlbyname("kern.sdk_version",&sdk,&len,nullptr,0)||len!=sizeof sdk) {
             note("firmware SDK query unavailable; continuing with runtime checks");sdk=0;
         }
-        pid_t pid=shell_pid(); note("target SceShellUI pid=%d sdk=0x%08x",pid,sdk);
+        pid_t pid=reattaching?next.pid:shell_pid(); note("target SceShellUI pid=%d sdk=0x%08x",pid,sdk);
         if(pid<=1||stopping()) break;
+        ShellIdentity target=reattaching?next:ShellIdentity{pid,0};
+        if(reattaching) {
+            ShellIdentity checked{};
+            if(replacement_snapshot(previous,checked)!=ShellStatus::Live||checked.pid!=target.pid||checked.started!=target.started) {
+                note("ShellUI replacement identity changed before attachment; refusing retry"); break;
+            }
+        }
+        if(shell_status(target,!reattaching)!=ShellStatus::Live) { note("ShellUI identity unavailable; refusing attachment"); break; }
         Ready r{}; State s{};
         bool resident=ready(r,pid),replacing=false;
 #ifdef PROBE_DEV_REPLACE
@@ -896,9 +948,14 @@ int main() {
             if(!replacing&&already_attempted(pid)) {
                 note("an earlier loader attempt lacks valid readiness; restart ShellUI or reboot before retrying"); break;
             }
+            if(!wait_for_preflight(target)) break;
+            if(stopping()||shell_status(target)!=ShellStatus::Live) { note("ShellUI identity lost before loader attempt"); break; }
             if(!mark_attempt(pid)) { note("cannot record loader attempt; aborting"); break; }
             (void)unlink(ready_path);
-            auto result=common_fps::ps5::inject_shellui_stable(pid,home_bridge_blob,home_bridge_blob_size);
+            auto result=common_fps::ps5::inject_shellui_stable(common_fps::ps5::ShellProcessIdentity{target.pid,target.started},home_bridge_blob,home_bridge_blob_size);
+            note("attached preflight status=%d resolved=%zu missing=%zu first=%s pthread_create=%u getpid=%u",
+                 result.preflight_status,result.preflight_resolved,result.preflight_unresolved,
+                 result.preflight_first_unresolved,result.preflight_pthread_create,result.preflight_getpid);
             note("loader mapped=%u thread=%u detached=%u auth_restored=%u unresolved=%u first=%s",
                  result.elf_loaded,result.pthread_create_ok,result.detached,result.auth_restored,
                  result.imports_unresolved,result.first_unresolved?result.first_unresolved:"");
@@ -940,27 +997,54 @@ int main() {
         FocusGuard focus;
         if(!focus.start(r)) { note("focus guardian unavailable; overlay not armed"); break; }
 #endif
-        if(!transaction(r,original,desired,trampoline,displaced,true,input)) {
+        if(!transaction(target,r,original,desired,trampoline,displaced,true,input)) {
+            if(shell_status(target)!=ShellStatus::Live) {
+                note("hook install failed and ShellUI identity changed; refusing old-process readback");
+                break;
+            }
             note("hook install failed; checking for a surviving own hook");
             unsigned char observed[16];
             int rc=mdbg_copyout(pid,(intptr_t)r.state.update,observed,16);
             bool unchanged=!rc&&!std::memcmp(observed,original,16);
             bool own_hook=!rc&&!std::memcmp(observed,desired,16);
             note("failed install readback rc=%d original_unchanged=%u own_hook=%u",rc,unchanged,own_hook);
-            if(own_hook) (void)transaction(r,desired,original,nullptr,0,false,input);
-            else if(input) (void)transaction(r,original,original,nullptr,0,false,input);
+            if(own_hook) (void)transaction(target,r,desired,original,nullptr,0,false,input);
+            else if(input) (void)transaction(target,r,original,original,nullptr,0,false,input);
             break;
         }
         note("hook installed; %s scene experiment running",input_mode?"timed controller":"passive global");
         auto deadline=sceKernelGetProcessTime()+(std::uint64_t)(session_seconds+15)*1000000;
         std::uint32_t last=0;
 #ifdef PROBE_PLAYER
-        PlayerLink link;
+        PlayerLink link(target);
 #endif
 #ifdef PROBE_NATIVE
         static SystemStats system; // two thread snapshots: too large for the stack
 #endif
+        ShellStatus target_status=ShellStatus::Live;
+        std::uint64_t next_identity_check=0;
         while(sceKernelGetProcessTime()<deadline) {
+            const auto now=sceKernelGetProcessTime();
+            if(now>=next_identity_check) {
+                auto status=shell_status(target);
+                next_identity_check=now+1000000;
+                if(status==ShellStatus::Unsafe) {
+                    // A rest transition can leave the old process temporarily
+                    // stopped. Do no remote work while its identity or state is
+                    // uncertain; wait for it either to resume or disappear.
+                    note("ShellUI target ambiguous or stopped; waiting without remote operations");
+                    const auto until=sceKernelGetProcessTime()+15000000;
+                    while(status==ShellStatus::Unsafe&&!stopping()&&sceKernelGetProcessTime()<until) {
+                        usleep(250000);
+                        status=shell_status(target);
+                    }
+                }
+                if(status!=ShellStatus::Live) {
+                    note("ShellUI target %s; abandoning old-process operations",
+                         status==ShellStatus::Absent?"absent":"ambiguous or stopped");
+                    target_status=status; break;
+                }
+            }
 #ifdef PROBE_CAPTURE
             const auto requested=sceKernelGetProcessTime();
 #endif
@@ -987,7 +1071,7 @@ int main() {
             link.tick(s);
 #endif
 #ifdef PROBE_NATIVE
-            system.tick(s,sdk,link.linked());
+            system.tick(s,sdk);
 #endif
 #ifdef PROBE_CAPTURE
             usleep(s.input_active?20000:100000);
@@ -995,12 +1079,37 @@ int main() {
             usleep(100000);
 #endif
         }
+        if(target_status==ShellStatus::Live) target_status=shell_status(target);
+        if(target_status!=ShellStatus::Live) {
+            // In particular, do not send a stop marker or restore hooks using
+            // addresses from a dead, stopped, or PID-reused ShellUI. PlayerLink
+            // is destroyed on leaving this scope, closing its broker sockets.
+            note("ShellUI cleanup refused: target identity is not safely live");
+            bool focus_relinquished=true;
+#ifdef PROBE_CAPTURE
+            focus_relinquished=focus.abandon();
+#endif
+            if(target_status==ShellStatus::Absent) clear_owned_stop_marker();
+            if(target_status==ShellStatus::Absent&&focus_relinquished&&!stopping()&&
+               discover_replacement(target,next)) {
+                previous=target; reattaching=true; continue;
+            }
+            note("ShellUI reattachment refused: target or focus not safely resolved");
+            break;
+        }
         bool clean=(s.phase==Done||s.phase==Failed)&&s.removed;
         if(!clean) {
             note("cleanup timeout; stopping bridge before hook restoration");
             (void)request_worker_stop();
             auto grace=sceKernelGetProcessTime()+5000000;
-            while(sceKernelGetProcessTime()<grace&&read_state(r,s)) {
+            std::uint64_t next_grace_check=0;
+            while(sceKernelGetProcessTime()<grace) {
+                const auto now=sceKernelGetProcessTime();
+                if(now>=next_grace_check) {
+                    next_grace_check=now+1000000;
+                    if(shell_status(target)!=ShellStatus::Live) break;
+                }
+                if(!read_state(r,s)) break;
 #ifdef PROBE_CAPTURE
                 focus.tick(s,true,sceKernelGetProcessTime(),false);
 #endif
@@ -1008,10 +1117,38 @@ int main() {
                 if(clean) break; usleep(100000);
             }
         }
+        target_status=shell_status(target);
+        if(target_status!=ShellStatus::Live) {
+            bool focus_relinquished=true;
+#ifdef PROBE_CAPTURE
+            focus_relinquished=focus.abandon();
+#endif
+            note("ShellUI changed during cleanup; refusing focus and hook restoration");
+            if(target_status==ShellStatus::Absent) clear_owned_stop_marker();
+            if(target_status==ShellStatus::Absent&&focus_relinquished&&!stopping()&&
+               discover_replacement(target,next)) {
+                previous=target; reattaching=true; continue;
+            }
+            break;
+        }
 #ifdef PROBE_CAPTURE
         bool focus_clean=focus.finish();
 #endif
-        bool hook_restored=transaction(r,desired,original,nullptr,0,false,input);
+        target_status=shell_status(target);
+        if(target_status!=ShellStatus::Live) {
+            note("ShellUI changed during cleanup; refusing old hook restoration");
+            if(target_status==ShellStatus::Absent) clear_owned_stop_marker();
+            bool focus_relinquished=true;
+#ifdef PROBE_CAPTURE
+            focus_relinquished=focus_clean;
+#endif
+            if(target_status==ShellStatus::Absent&&focus_relinquished&&!stopping()&&
+               discover_replacement(target,next)) {
+                previous=target; reattaching=true; continue;
+            }
+            break;
+        }
+        bool hook_restored=transaction(target,r,desired,original,nullptr,0,false,input);
         note("SUMMARY scene_removed=%u hook_restored=%u phase=%u frames=%llu resident_worker=1",
              clean,hook_restored,s.phase,(unsigned long long)s.frames);
 #ifdef PROBE_PLAYER
@@ -1049,7 +1186,8 @@ int main() {
             (s.release_reason!=Deadline&&s.release_reason!=BackButton&&s.release_reason!=StopRequest);
 #endif
 #endif
-    } while(false);
+        break;
+    } while(true);
     note("END result=%s shell_log=%s",failed?"error":"complete",shell_log);
     std::fclose(output); close(lock); return failed;
 }

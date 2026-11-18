@@ -70,7 +70,7 @@ struct TileInfo {
     long long since = 0;  // registration order, for ties
 };
 
-inline TileInfo system_tile() { return {kSystemTile, "kabuki", Card::stats, "System", "chip", 900, 0}; }
+inline TileInfo system_tile() { return {kSystemTile, "kabuki", Card::stats, "Stats", "chip", 900, 0}; }
 inline TileInfo settings_tile() { return {kSettingsTile, "kabuki", Card::settings, "Settings", "icon:iconid_settings", 901, 0}; }
 
 inline Records& add_tile(Records& r, const TileInfo& t) {

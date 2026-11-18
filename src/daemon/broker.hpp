@@ -228,7 +228,6 @@ private:
         if (!c.provider.empty() && c.hello) {
             for (const auto& t : c.tiles) tiles_.erase(t);
             s_.remove_provider(c.provider);
-            if (c.provider == "librespot") s_.set_system_note("Not running");
         }
         log("BROKER " + (c.provider.empty() ? "client " + std::to_string(id) : c.provider) + " dropped: " + why);
     }
@@ -275,8 +274,20 @@ private:
 
     // A picture path for a card: inside one of the provider's folders and passing the file check.
     // "" if it isn't.
-    std::string art(Client& c, const std::string& path, Issues& issues) {
-        if (path.empty()) return "";
+    std::string art(Client& c, const std::string& supplied, Issues& issues) {
+        if (supplied.empty()) return "";
+        std::string path = supplied;
+        // Compact art is a single filename in the first declared directory, never
+        // a path. It goes through exactly the same checks as an absolute path.
+        if (supplied[0] == '~') {
+            const auto name = supplied.substr(1);
+            if (name.empty() || name == "." || name == ".." ||
+                !std::all_of(name.begin(), name.end(), [](unsigned char ch) {
+                    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                           (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.';
+                })) { issues.add("bad_art", "invalid compact picture name"); return ""; }
+            path = c.dirs.front() + "/" + name;
+        }
         for (const auto& dir : c.dirs) {
             if (!art_inside(dir, path)) continue;
             if (hooks_.art_ok) {
@@ -335,9 +346,8 @@ private:
         };
         p.shown = [this, id](const std::string& tile) { send(id, {{"shown", {{"tile", tile}}}}); };
         s_.add_provider(name, p);
-        if (name == "librespot") s_.set_system_note("Connected");
 
-        send(id, {{"welcome", {{"kabuki", version_}, {"versions", {1}}, {"art_dir", default_dir}, {"templates", {"media", "list", "plugin"}},
+        send(id, {{"welcome", {{"kabuki", version_}, {"versions", {1}}, {"art_dir", default_dir}, {"templates", {"media", "list", "plugin"}}, {"art_prefix_v1", true},
                                {"limits", {{"tiles", kBrokerTiles}, {"rows", kBrokerRows}, {"text", kBrokerText}, {"title", kBrokerTitle},
                                            {"line", kBrokerLine}, {"updates_per_second", int(1000 / kBrokerUpdateMs)}}}}}});
         report(id, issues, "");
@@ -587,7 +597,6 @@ private:
         Issues issues;
         set_text(m, "note", c.note, issues, 60);
         report(id, issues, "");
-        if (c.provider == "librespot") s_.set_system_note(c.note.empty() ? "Connected" : c.note);
     }
 };
 

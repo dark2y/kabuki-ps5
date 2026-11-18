@@ -30,6 +30,8 @@
 #include <ps5/kernel.h>
 #include <ps5/nid.h>
 
+#include "stable_elfldr_preflight.h"
+
 #if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wsign-compare"
@@ -108,6 +110,108 @@ static intptr_t commonfps_resolve_external(pid_t pid, const char* name) {
     }
 
     return 0;
+}
+
+/* Range checks use subtraction, never potentially wrapping offset + size. */
+static bool preflight_range(size_t size, uint64_t offset, uint64_t length) {
+    return offset <= size && length <= size - (size_t)offset;
+}
+
+static void preflight_section(const uint8_t* elf, const Elf64_Ehdr* ehdr,
+                              size_t index, Elf64_Shdr* section) {
+    memcpy(section, elf + (size_t)ehdr->e_shoff + index * sizeof(*section),
+           sizeof(*section));
+}
+
+/* First validate the entire structure, then resolve. This prevents a late
+ * malformed section from being misreported as an ordinary missing import. */
+int commonfps_stable_elfldr_preflight(pid_t pid, const uint8_t* elf, size_t size,
+                                      struct commonfps_preflight_result* result) {
+    if (!result)
+        return COMMONFPS_PREFLIGHT_MALFORMED;
+    memset(result, 0, sizeof(*result));
+    if (!elf || size < sizeof(Elf64_Ehdr))
+        return COMMONFPS_PREFLIGHT_MALFORMED;
+
+    Elf64_Ehdr ehdr;
+    memcpy(&ehdr, elf, sizeof(ehdr));
+    if (memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64 ||
+        ehdr.e_ident[EI_DATA] != ELFDATA2LSB ||
+        ehdr.e_ident[EI_VERSION] != EV_CURRENT || ehdr.e_version != EV_CURRENT ||
+        ehdr.e_ehsize != sizeof(ehdr) || ehdr.e_type != ET_DYN ||
+        ehdr.e_machine != EM_X86_64 || ehdr.e_shnum == 0 ||
+        ehdr.e_shentsize != sizeof(Elf64_Shdr) ||
+        !preflight_range(size, ehdr.e_shoff,
+                         (uint64_t)ehdr.e_shnum * sizeof(Elf64_Shdr)))
+        return COMMONFPS_PREFLIGHT_MALFORMED;
+
+    for (int pass = 0; pass < 2; ++pass) {
+        for (size_t i = 0; i < ehdr.e_shnum; ++i) {
+            Elf64_Shdr rel, sym, str;
+            preflight_section(elf, &ehdr, i, &rel);
+            if (rel.sh_type != SHT_RELA)
+                continue;
+            if (rel.sh_entsize != sizeof(Elf64_Rela) ||
+                rel.sh_size % sizeof(Elf64_Rela) != 0 ||
+                !preflight_range(size, rel.sh_offset, rel.sh_size))
+                return COMMONFPS_PREFLIGHT_MALFORMED;
+
+            bool have_symbols = false;
+            for (size_t j = 0; j < rel.sh_size / sizeof(Elf64_Rela); ++j) {
+                Elf64_Rela entry;
+                memcpy(&entry, elf + (size_t)rel.sh_offset + j * sizeof(entry),
+                       sizeof(entry));
+                const uint32_t type = (uint32_t)ELF64_R_TYPE(entry.r_info);
+                if (type == R_X86_64_NONE || type == R_X86_64_RELATIVE)
+                    continue;
+                if (type != R_X86_64_64 && type != R_X86_64_GLOB_DAT)
+                    return COMMONFPS_PREFLIGHT_MALFORMED;
+                if (!have_symbols) {
+                    if (rel.sh_link >= ehdr.e_shnum)
+                        return COMMONFPS_PREFLIGHT_MALFORMED;
+                    preflight_section(elf, &ehdr, rel.sh_link, &sym);
+                    if ((sym.sh_type != SHT_DYNSYM && sym.sh_type != SHT_SYMTAB) ||
+                        sym.sh_entsize != sizeof(Elf64_Sym) ||
+                        sym.sh_size % sizeof(Elf64_Sym) != 0 ||
+                        !preflight_range(size, sym.sh_offset, sym.sh_size) ||
+                        sym.sh_link >= ehdr.e_shnum)
+                        return COMMONFPS_PREFLIGHT_MALFORMED;
+                    preflight_section(elf, &ehdr, sym.sh_link, &str);
+                    if (str.sh_type != SHT_STRTAB ||
+                        !preflight_range(size, str.sh_offset, str.sh_size))
+                        return COMMONFPS_PREFLIGHT_MALFORMED;
+                    have_symbols = true;
+                }
+                size_t index = (size_t)ELF64_R_SYM(entry.r_info);
+                if (index >= sym.sh_size / sizeof(Elf64_Sym))
+                    return COMMONFPS_PREFLIGHT_MALFORMED;
+                Elf64_Sym symbol;
+                memcpy(&symbol, elf + (size_t)sym.sh_offset + index * sizeof(symbol),
+                       sizeof(symbol));
+                if (symbol.st_name >= str.sh_size)
+                    return COMMONFPS_PREFLIGHT_MALFORMED;
+                const char* name = (const char*)elf + (size_t)str.sh_offset + symbol.st_name;
+                if (!memchr(name, '\0', (size_t)str.sh_size - symbol.st_name))
+                    return COMMONFPS_PREFLIGHT_MALFORMED;
+                if (pass == 0 || symbol.st_shndx != SHN_UNDEF)
+                    continue;
+                if (commonfps_resolve_external(pid, name)) {
+                    ++result->resolved;
+                } else {
+                    if (result->unresolved++ == 0) {
+                        strncpy(result->first_unresolved, name,
+                                sizeof(result->first_unresolved) - 1);
+                    }
+                }
+            }
+        }
+    }
+    char nid[12];
+    result->pthread_create_available = nid_encode("pthread_create", nid) &&
+                                        pt_resolve(pid, nid) != 0;
+    result->getpid_available = pt_resolve(pid, "HoLVWNanBBc") != 0;
+    return result->unresolved ? COMMONFPS_PREFLIGHT_UNRESOLVED : COMMONFPS_PREFLIGHT_OK;
 }
 
 static int commonfps_apply_relocations(

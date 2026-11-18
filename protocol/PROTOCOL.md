@@ -268,3 +268,13 @@ kabuki   → {"v":1,"shown":{"tile":"EXAMPL"}}
 kabuki   → {"v":1,"action":{"tile":"EXAMPL","action":"select","key":"n"}}
 provider → {"v":1,"content":{"tile":"EXAMPL","data":{"top":{"rows":[{"key":"n","title":"Count: 1"},{"key":"reset","title":"Reset"}]}}}}
 ```
+
+### Compact artwork filenames (optional extension)
+
+A `welcome` with `art_prefix_v1: true` permits an `art` string of `~` followed
+by a single filename in the first accepted `art_dirs` directory (or the default
+directory). The filename must contain only ASCII letters, digits, `-`, `_`, or
+`.` and cannot be `.` or `..`. Kabuki expands it and applies the same path,
+extension, file size and symlink checks as for an absolute path. Providers must
+continue to use absolute paths unless this exact capability is advertised.
+Tile icons may use the same compact form after `file:`.

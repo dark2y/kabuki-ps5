@@ -32,7 +32,8 @@ along with this program; see the file COPYING. If not, see
 
 
 static int
-sys_ptrace(int request, pid_t pid, caddr_t addr, int data) {
+sys_ptrace_impl(int request, pid_t pid, caddr_t addr, int data, int *syscall_succeeded) {
+  if(syscall_succeeded) *syscall_succeeded = 0;
   uint8_t privcaps[16] = {0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
                           0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff};
   pid_t mypid = getpid();
@@ -57,6 +58,7 @@ sys_ptrace(int request, pid_t pid, caddr_t addr, int data) {
   }
 
   ret = (int)syscall(SYS_ptrace, request, pid, addr, data);
+  if(syscall_succeeded && ret != -1) *syscall_succeeded = 1;
 
   /* Local change: attempt both restorations even when the first fails. */
   int saved_errno = errno;
@@ -72,6 +74,11 @@ sys_ptrace(int request, pid_t pid, caddr_t addr, int data) {
   return ret;
 }
 
+
+static int
+sys_ptrace(int request, pid_t pid, caddr_t addr, int data) {
+  return sys_ptrace_impl(request, pid, addr, data, NULL);
+}
 
 intptr_t
 pt_resolve(pid_t pid, const char* nid) {
@@ -93,14 +100,21 @@ pt_trace_me(void) {
 
 int
 pt_attach(pid_t pid) {
-  if(sys_ptrace(PT_ATTACH, pid, 0, 0) == -1) {
+  int attached = 0;
+  int rc = sys_ptrace_impl(PT_ATTACH, pid, 0, 0, &attached);
+  if(!attached) return -1;
+
+  int status = 0;
+  pid_t waited;
+  do { waited = waitpid(pid, &status, 0); } while(waited < 0 && errno == EINTR);
+  if(rc == -1 || waited != pid || !WIFSTOPPED(status)) {
+    /* Best effort: wait failure may mean not yet stopped, and credential
+       restoration failure can also prevent detach. */
+    int saved_errno = errno;
+    (void)sys_ptrace(PT_DETACH, pid, 0, 0);
+    errno = saved_errno;
     return -1;
   }
-
-  if(waitpid(pid, 0, 0) < 0) {
-    return -1;
-  }
-
   return 0;
 }
 

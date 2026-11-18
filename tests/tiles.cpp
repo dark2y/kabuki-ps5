@@ -83,7 +83,11 @@ int main() {
     service.set_list("LSPLIB",library);now+=1000;model.poll_files(now);
     model.tick(++now,1,0,0,true);
     model.tick(++now,1,0,0x40,false);model.tick(++now,1,0,0x40,false);
-    model.tick(++now,1,0,0x4000,false);model.tick(++now,1,0,0x4000,false);
+    model.tick(++now,1,0,0x4000,false); // Open the icon without entering its card.
+    assert(model.view().tile=="LSPLIB"&&!model.view().focused);
+    model.tick(++now,1,0,0x80,false); // Right explicitly enters the card.
+    assert(model.view().focused);
+    model.tick(++now,1,0,0x4000,false);
     assert(model.view().tile=="LSPLIB"&&model.view().list.level==1&&model.view().list.loading);
     library.top.rows[0].title="Updated";service.set_list("LSPLIB",library);
     now+=1000;model.poll_files(now);assert(model.view().list.level==1&&model.view().list.loading);
@@ -132,6 +136,7 @@ int main() {
     say(a, {{"hello", {{"provider", "example"}, {"tiles", {tile("hello1", "list")}}}}});
     assert(heard[a].size() == 1 && heard[a][0].contains("welcome") && heard[a][0]["welcome"]["versions"][0] == 1);
     assert(heard[a][0]["welcome"]["art_dir"] == "/data/test-art/example");
+    assert(heard[a][0]["welcome"]["art_prefix_v1"] == true);
     assert(online("HELLO1") && bservice.owns("example", "HELLO1"));
     assert((arrange(bservice.settings(), bservice.tiles()) == std::vector<std::string>{"HELLO1", kSystemTile, kSettingsTile}));
     heard[a].clear();
@@ -248,7 +253,8 @@ int main() {
     heard[g].clear();
     const std::string good = "/data/art/mine/cover.PNG";
     for (const std::string& path : {std::string("/data/art/mine/../other.png"), std::string("/data/art/other/c.png"), std::string("/data/art/mine/c.gif"),
-                                    std::string("/data/art/mine/evil.png"), std::string("art/mine/c.png")}) {
+                                    std::string("/data/art/mine/evil.png"), std::string("art/mine/c.png"),
+                                    std::string("~../other.png"), std::string("~/absolute.png"), std::string("~evil.png"), std::string("~c.gif"), std::string("~.")}) {
         bnow += 200;
         say(g, {{"content", {{"tile", "ARTIST"}, {"data", {{"art", path}}}}}});
         assert(codes(g) == std::vector<std::string>{"bad_art"});
@@ -258,6 +264,9 @@ int main() {
     say(g, {{"content", {{"tile", "ARTIST"}, {"data", {{"art", good}}}}}});
     assert(codes(g).empty() && parse_content(read_file(bdir + "/" + content_file("ARTIST"))).m.art == good);
     assert(std::count(checked_art.begin(), checked_art.end(), good) == 1);
+    bnow += 200;
+    say(g, {{"content", {{"tile", "ARTIST"}, {"data", {{"art", "~cover.PNG"}}}}}});
+    assert(codes(g).empty() && parse_content(read_file(bdir + "/" + content_file("ARTIST"))).m.art == good);
     broker.closed(g);
 
     // A provider going away takes its tiles off the rail; a new one lands before Kabuki's own.

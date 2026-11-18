@@ -52,18 +52,21 @@ int main() {
         for (int i = 0; i < 50; ++i) { layout.frame(view, true, now, view.opening); now += 20000; }
     };
     const auto system_labels = [&](bool visible) {
-        for (const char* label : {"Performance", "Console", "CPU", "Memory", "Frame rate", "Temperature",
-                                  "Firmware", "Uptime", "IP address", "librespot-ps5"})
+        for (const char* label : {"Performance", "Console", "CPU", "Memory", "Frame rate", "CPU temperature", "SoC temperature", "Fan speed",
+                                  "Firmware", "Uptime", "IP address"})
             assert(backend.visible(label) == visible);
     };
     view.tile = "LSPNOW"; view.tab = overlay::kMedia; view.header = "Now Playing";
     settle();
     system_labels(false);
     view.tile = "KBKSYS"; view.tab = overlay::kStats; view.header = "System";
-    view.system.cpu = 25; view.system.firmware = "13.20";
+    view.system.cpu = 25; view.system.cpu_temp = 43; view.system.soc_temp = 38; view.system.fan_duty = 17; view.system.firmware = "13.20";
     settle();
     system_labels(true);
     assert(backend.visible("25%"));
+    assert(backend.visible("43°C"));
+    assert(backend.visible("38°C"));
+    assert(backend.visible("17%"));
     assert(backend.visible("13.20"));
     assert(!backend.visible("Shuffle"));
     view.system.cpu = -1;
