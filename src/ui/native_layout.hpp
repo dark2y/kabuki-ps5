@@ -420,8 +420,8 @@ public:
              // Kabuki's version: the bottom left of the screen while the panel is open.
              // With Settings showing, bottom left of the screen: Kabuki's version and where it comes from.
              b.image(side_more_, c, {kCardW - kPad - 28, kListTop + 3 * kSettingH + (kSettingH - 6) / 2 - 14, 28, 28}, b.icon("iconid_arrow_right")) &&
-             b.label(version_, b.screen(), text_box(48, 1080 - 66, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v1.0.0") &&
-             b.label(version_low_, b.screen(), text_box(48, 1080 - 38, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v1.0.0") &&
+             b.label(version_, b.screen(), text_box(48, 1080 - 66, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v1.2.0") &&
+             b.label(version_low_, b.screen(), text_box(48, 1080 - 38, 500, 20), 20, normal, kSecondary, left, ellipsis, "Kabuki v1.2.0") &&
              b.image(side_star_, c, {0, 0, 22, 22}, b.icon("iconid_rating")) &&
              b.label(link_, b.screen(), text_box(48, 1080 - 38, 500, 20), 20, normal, kSecondary, left, ellipsis,
                      "github.com/stupiditytries") &&
@@ -682,7 +682,7 @@ private:
             b.alpha(set_value_[0], 0.6f + 0.4f * float(std::sin(now / 1e6 * 5.0) * 0.5 + 0.5));
             b.words(set_note_, "");
         } else {
-            b.words(set_value_[0], chord_name(st.chord));
+            b.words(set_value_[0], "Touchpad touch");
             b.alpha(set_value_[0], 1);
             b.words(set_note_, "");
         }

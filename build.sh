@@ -36,7 +36,7 @@ common=(-Oz -ffunction-sections -fdata-sections -march=znver2 -fPIC -Wall -Wextr
     -I"$repo/src/shellui" -I"$repo/src/ui" \
     -shared -Wl,--gc-sections -Wl,-e,elf_main -Wl,-Bsymbolic -Wl,--hash-style=sysv -Wl,--eh-frame-hdr \
     -Wl,-T,"$repo/src/shellui/constructors.ld" \
-    "$repo/src/shellui/worker.cpp" -lScePad -lmonosgen-2.0 -lkernel_sys -lSceLibcInternal -o "$out/worker.elf"
+    "$repo/src/shellui/worker.cpp" -lScePad -lSceUserService -lmonosgen-2.0 -lkernel_sys -lSceLibcInternal -o "$out/worker.elf"
 
 "$sdk/bin/prospero-strip" --strip-unneeded "$out/worker.elf"
 

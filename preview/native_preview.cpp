@@ -218,7 +218,7 @@ int main(int argc, char** argv) {
         auto* h=dlopen((base+".so").c_str(),RTLD_NOW|RTLD_LOCAL);return h?reinterpret_cast<std::uintptr_t>(dlsym(h,"kabuki_plugin_v1")):0;
 #endif
     };
-    kabuki::Broker broker(service, hooks, "/data/kabuki/art", "1.0.0");
+    kabuki::Broker broker(service, hooks, "/data/kabuki/art", "1.2.0");
     bool run_service = true, started = false;
     auto commands = nlohmann::json::array();
     overlay::NativeModel model([&](int kind, int value, const char* text) {

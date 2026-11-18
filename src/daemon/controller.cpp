@@ -167,7 +167,7 @@ static bool art_check(const std::string& dir,const std::string& path) {
 class PlayerLink {
 public:
     PlayerLink() : service("/data/custom-overlays",monotonic_ms),
-                   broker(service,broker_hooks(),"/data/custom-overlays/art","1.0.0") {
+                   broker(service,broker_hooks(),"/data/custom-overlays/art","1.2.0") {
         service.load_settings();
     }
     ~PlayerLink() {
@@ -752,7 +752,7 @@ int main() {
 #ifdef PROBE_INPUT
 #ifdef PROBE_TOGGLE
 #ifdef PROBE_CAPTURE
-    note("toggle L3+R3 hold_ms=%llu limit_ms=%llu session_s=%u game_focus_lease=1 guardian=native_parent clocks=relative",
+    note("toggle touchpad touch hold_ms=%llu limit_ms=%llu session_s=%u game_focus_lease=1 guardian=native_parent clocks=relative",
          (unsigned long long)(chord_hold_us/1000),(unsigned long long)(input_limit_us/1000),session_seconds);
 #else
     note("toggle L3+R3 hold_ms=2000 limit_ms=10000 session_s=120 raw_observe=1 game_exclusive=0");

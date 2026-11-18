@@ -26,7 +26,7 @@
 
 Kabuki is a native control panel for homebrew that runs ShellUI code.
 
-Hold your configured shortcut (default: **L3 + R3**) and Kabuki pops in from the right, over the home screen or your game, using the console's own interface toolkit, fonts, icons, focus effects and sounds.
+Touch and hold a finger on the controller's touchpad (default: **0.5 seconds**) and Kabuki pops in from the right, over the home screen or your game, using the console's own interface toolkit, fonts, icons, focus effects and sounds.
 
 Payloads can add their own tiles, display information and receive controller input through Kabuki. System readings and settings are built in; [librespot-ps5](https://github.com/stupiditytries/librespot-ps5) adds music controls, a queue and a library browser.
 
@@ -38,11 +38,11 @@ Payloads can add their own tiles, display information and receive controller inp
 
 ## What it does
 
-- *Opens over the home screen or a game.* Hold a configurable button shortcut to bring up the panel.
+- *Opens over the home screen or a game.* Keep a finger on the touchpad to bring up the panel.
 - *Uses the console's native UI.* PUI widgets, SST fonts, system icons, UI3 glass focus and interface sounds.
 - *Keeps your controls together.* Choose and arrange up to seven visible tiles; the first tile opens with the panel.
 - *Shows system readings.* CPU load, memory, temperatures and frame rate where the console exposes it.
-- *Lets you make it yours.* Change the shortcut, its hold time, interface sounds and tile order from Kabuki Settings.
+- *Lets you make it yours.* Change the touch duration, interface sounds and tile order from Kabuki Settings.
 - *Hosts homebrew tiles.* Providers can use ready-made media and list cards, or supply a native plugin for a custom card.
 
 ### With librespot-ps5
@@ -70,18 +70,18 @@ Kabuki's System and Settings tiles work independently of a music receiver.
 1. Put `kabuki-ps5.elf` on a USB drive. If you use librespot-ps5, put it beside `librespot-ps5.elf`.
 2. Load Kabuki manually with your payload loader.
 3. Load any compatible providers you want to use.
-4. Hold **L3 + R3 for half a second** to open the panel.
+4. Touch the **touchpad for half a second**, without clicking, to open the panel.
 
 | Control | Action |
 |---|---|
-| L3 + R3, held | Open or close Kabuki with the default shortcut |
+| Touchpad touch, held | Open or close Kabuki with the default shortcut |
 | D-pad | Move through the sidebar and the selected card |
 | Cross | Open a tile, select an item or use a control |
 | Circle | Go back within a card, return to the sidebar or close the panel |
 
 Opening the console's own control centre closes Kabuki's panel.
 
-Your shortcut, hold time, sounds and tile arrangement are saved in `/data/custom-overlays`. Kabuki does not add itself to autoload. The same folder holds its logs and runtime records.
+Your touch duration, sounds and tile arrangement are saved in `/data/custom-overlays`. Kabuki does not add itself to autoload. The same folder holds its logs and runtime records.
 
 ## Adding your own tiles
 

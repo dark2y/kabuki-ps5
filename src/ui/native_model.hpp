@@ -501,7 +501,7 @@ public:
             sound(next!=setting?sound::list_move:sound::cursor_end); setting=next;
         }
         if(pressed&0x4000) {
-            if(setting==0) { recording=true; recorded=0; suppress=held; sound(sound::popup_open); }
+            if(setting==0) { sound(sound::cursor_end); }
             else if(setting==1) {
                 choosing=true; choice=0; sound(sound::popup_open);
                 for(int i=0;i<int(sizeof kHoldChoices/sizeof kHoldChoices[0]);++i) if(kHoldChoices[i]==settings.hold_ms) choice=i;
